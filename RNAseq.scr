@@ -1,0 +1,106 @@
+#!/bin/bash
+#SBATCH --job-name="cardio_bulkRNAseq"
+#SBATCH --time=24:00:0
+#SBATCH --partition=shared
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=12
+#SBATCH --mail-type=end
+#SBATCH --output=%x_%j.out
+
+ml anaconda
+conda activate ~/.conda/envs/cdRNAseq/
+
+
+#set main directory paths
+Cardio_Folder="/home/cduque1/scratch4-mmugnie1/carolina/Cardio"
+Genome_Folder="/home/cduque1/data-mmugnie1/carolina/Genomes"
+
+cd "$Cardio_Folder"
+
+# Create the output directories if they don't already exist
+for dir in "FASTqc_raw" "multiqc" "FASTqc_Clean" "Trimmed" "HiSat2/tempHiSat2" \
+           "featureCounts"; do
+    mkdir -p "$dir"
+done
+
+    #FASTqc to check quality. 1.22min per fastq file
+    fastqc \
+    --threads 8 \
+    ${Cardio_Folder}/FASTQ/*.fastq.gz \
+    --outdir ${Cardio_Folder}/FASTqc_raw
+
+    multiqc ${Cardio_Folder}/FASTqc_raw \
+    --filename CardioMultiqc.html \
+    -o ${Cardio_Folder}/multiqc
+
+
+for path in ${Cardio_Folder}/FASTQ/*fastq.gz; do
+        SAMPLEID="$(basename "${path}")"
+        if [[ "$(basename "${path}")" == *"R1_001"* ]]
+        then
+            	SAMPLEID=${SAMPLEID::-16}
+        else
+            	continue
+        fi
+
+        #BBDuk for trimming, did 2 (a single pair) in 3 min)
+        bbduk.sh \
+        in1=${Cardio_Folder}/FASTQ/${SAMPLEID}_R1_001.fastq.gz \
+        in2=${Cardio_Folder}/FASTQ/${SAMPLEID}_R2_001.fastq.gz \
+        out1=${Cardio_Folder}/Trimmed/${SAMPLEID}_1.fq.gz \
+        out2=${Cardio_Folder}/Trimmed/${SAMPLEID}_2.fq.gz \
+        t=12 \
+        ref=/home/cduque1/.conda/envs/cdRNAseq/opt/bbmap-38.18/resources/adapters.fa \
+        ktrim=r \
+        k=31 \
+        mink=11 \
+        hdist=2 \
+        rcomp=t \
+        tbo \
+        tpe \
+        qtrim=rl \
+        trimq=20 \
+        minlength=40
+
+
+        #HiSat2 mapping. I used HiSat2 pre-indexed genome that was made grom ENSEMBLEs grch38, release 84.
+        cd ${Cardio_Folder}/HiSat2
+        hisat2 \
+        --threads 9 \
+        -x ${Genome_Folder}/IndexHiSat2/grch38_snp_tran/genome_snp_tran \
+        -1 ${Cardio_Folder}/Trimmed/${SAMPLEID}_1.fq.gz\
+        -2 ${Cardio_Folder}/Trimmed/${SAMPLEID}_2.fq.gz \
+        -S ${SAMPLEID}.sam
+
+        #sortSAM files (and then removed them due to space)
+        cd ${Cardio_Folder}/HiSat2
+        samtools sort \
+        -@ 8 \
+        -T ${Cardio_Folder}/HiSat2/tempHiSat2 \
+        -o ${SAMPLEID}.bam \
+        ${Cardio_Folder}/HiSat2/${SAMPLEID}.sam
+        rm ${SAMPLEID}.sam
+
+
+done
+
+fastqc \
+--threads 9 \
+${Cardio_Folder}/Trimmed/*.fq.gz \
+--outdir ${Cardio_Folder}/FASTqc_Clean
+
+#featureCounts
+cd ${Cardio_Folder}/featureCounts
+featureCounts \
+-T 8 \
+-a ${Genome_Folder}/Human38/Homo_sapiens.GRCh38.84.gtf \
+-o UniqueCardioCounts_batch4.txt \
+-p \
+${Cardio_Folder}/HiSat2/*.bam \
+
+#multiqc everything
+cd ${Cardio_Folder}
+
+multiqc FASTqc_Clean featureCounts HiSat2 \
+--filename CardioMultiqcClean.html \
+-o ${Cardio_Folder}/multiqc
