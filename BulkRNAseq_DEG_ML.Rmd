@@ -1,0 +1,3167 @@
+---
+title: "Cardio_DGE_M_F_Analysis"
+author: "Carolina Duque"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, global_options, include=FALSE}
+knitr::opts_chunk$set(message=FALSE, tidy.opts=list(width.cutoff=60), tidy=TRUE) 
+```
+
+
+
+# DESeq2 setup
+
+Load all necessary packages
+```{r packages, message=FALSE, results='hide'}
+library(readxl)
+library(tidyverse)
+library(biomaRt)
+library(DESeq2)
+library(GGally)
+library(ggfortify)
+library(EnhancedVolcano)
+library(clusterProfiler)
+library("org.Hs.eg.db")
+library(enrichplot)
+library(scales)
+library(sva)
+library(randomForest)
+library(Boruta)
+library(caret)
+library(glmnet)
+library(pROC)
+library(pheatmap)
+library(RColorBrewer)
+library(ggvenn)
+
+```
+
+
+some functions
+
+```{r}
+
+get_annotated_results <- function(result_object, ensembl, FDR_threshold = 0.1, log2FC_cutoff = 0.58) {
+  # Retrieve gene annotations
+  annot_data <- getBM(
+    attributes = c('ensembl_gene_id', 'external_gene_name', 'description', "gene_biotype"),
+    filters = "ensembl_gene_id",
+    values = rownames(result_object),
+    mart = ensembl
+  )
+
+  # Merge annotation with result object
+  annot_result <- as.data.frame(result_object) %>%
+    rownames_to_column("ensembl_gene_id") %>%
+    left_join(annot_data, by = "ensembl_gene_id") %>%
+    dplyr::rename(log2FC = log2FoldChange, FDR = padj)
+
+  # Handle missing gene names
+  annot_result <- annot_result %>% mutate(
+    external_gene_name = case_when(
+      external_gene_name == "" | is.na(external_gene_name) ~ ensembl_gene_id,
+      TRUE ~ external_gene_name
+    )
+  )
+
+  return(annotated_results = annot_result)
+}
+
+
+annotate_ML <- function(df, ensembl){
+   # Retrieve gene annotations
+  annot_data <- getBM(
+    attributes = c('ensembl_gene_id', 'external_gene_name', 'description', "gene_biotype"),
+    filters = "ensembl_gene_id",
+    values = df$feature,
+    mart = ensembl
+  )
+
+  # Merge annotation with result object
+  annot_result <- as.data.frame(df) %>%
+    left_join(annot_data, by = c("feature" ="ensembl_gene_id"))
+
+  # Handle missing gene names
+  annot_result <- annot_result %>% mutate(
+    external_gene_name = case_when(
+      external_gene_name == "" | is.na(external_gene_name) ~ feature,
+      TRUE ~ external_gene_name
+    )
+  )
+
+  return(annotated_results = annot_result)
+}
+
+
+
+make_volcano <- function(annotation, labs = NULL, FDR_cutoff = 0.1, log2FC_cutoff = 0.58, title, up = "red", down = "blue"){
+
+
+y=4.5 #-log10(min(annotation$FDR))+0.15
+xmin= -4 #min(annotation$log2FC)-0.15
+xmax= 4 #max(annotation$log2FC)+0.15
+
+keyvals_Prog <- ifelse(
+    annotation$log2FC < -log2FC_cutoff & annotation$FDR<FDR_cutoff, down,
+      ifelse(annotation$log2FC > log2FC_cutoff & annotation$FDR<FDR_cutoff, up,
+            ifelse((annotation$log2FC< -log2FC_cutoff | annotation$log2FC> log2FC_cutoff )& annotation$FDR>FDR_cutoff,'black',
+                   ifelse(annotation$log2FC > -log2FC_cutoff & annotation$log2FC < log2FC_cutoff & annotation$FDR<FDR_cutoff,'black',
+        'grey'))))
+
+ 
+if(is.null(labs)) {
+  labels = NA
+} else labels = annotation$external_gene_name
+
+ 
+keyvals_Prog[is.na(keyvals_Prog)] <- 'grey'
+names(keyvals_Prog)[keyvals_Prog == up] <- 'upregulated'
+names(keyvals_Prog)[keyvals_Prog == 'grey'] <- 'nonsignificant'
+names(keyvals_Prog)[keyvals_Prog == 'black'] <- 'mid'
+names(keyvals_Prog)[keyvals_Prog == down] <- 'downregulated'
+
+EnhancedVolcano(annotation,
+                lab = labels,
+                x = 'log2FC',
+                y = 'FDR',
+                colCustom = keyvals_Prog,
+                ylab = bquote(~-Log[10] ~ "FDR"),
+                selectLab = labs,
+                ylim = c(0, y),
+                xlim = c(xmin,xmax),
+                title = title,
+                subtitle = NULL,
+                legendPosition = "top",
+                boxedLabels = TRUE,
+                drawConnectors = TRUE,
+                legendLabSize = 9,
+                legendIconSize = 3,
+                max.overlaps = 12,
+                axisLabSize = 16,
+                titleLabSize = 13,
+                colAlpha = 0.7,
+                pCutoff = FDR_cutoff,
+                FCcutoff = 0.5,
+                pointSize = 3.7,
+                labSize = 6.5,
+                gridlines.minor = FALSE,
+    gridlines.major = FALSE)
+
+
+}
+
+BP_MF_GSEA <- function(annotation, comp = "ABvAA"){
+  
+genelist=annotation$log2FC
+names(genelist) = as.character(annotation$ensembl_gene_id)
+genelist = sort(genelist, decreasing = TRUE)
+set.seed(12345)
+
+GSEA_BP <- gseGO(geneList     = genelist,
+              OrgDb        = org.Hs.eg.db,
+              ont          = "BP",
+              keyType       = 'ENSEMBL',
+              minGSSize    = 10,
+              maxGSSize    = 500,
+              pvalueCutoff = 0.05,
+              verbose      = TRUE)
+
+
+GSEA_BP_Annot <- setReadable(GSEA_BP, 'org.Hs.eg.db', 'ENSEMBL')
+
+set.seed(12345)
+
+GSEA_MF <- gseGO(geneList     = genelist,
+              OrgDb        = org.Hs.eg.db,
+              ont          = "MF",
+              keyType       = 'ENSEMBL',
+              minGSSize    = 10,
+              maxGSSize    = 500,
+              pvalueCutoff = 0.05,
+              verbose      = TRUE)
+
+
+GSEA_MF_Annot <- setReadable(GSEA_MF, 'org.Hs.eg.db', 'ENSEMBL')
+
+GSEA_list <- list(
+  GSEA_BP_Annot,
+  GSEA_MF_Annot
+)
+
+names(GSEA_list) <- c(
+  paste0("BP_", comp),
+  paste0("MF_", comp)
+)
+  return(GSEA_list) 
+  
+}
+
+
+simplify_gsea <- function(gsea_list, sim_cutoff = 0.7){
+  set.seed(12345)
+
+  gsea_list_simple <- list()
+  
+  for (i in seq_along(gsea_list)){
+  gsea <- gsea_list[[i]]
+  name <- names(gsea_list)[[i]]
+  
+  gsea_new <- clusterProfiler::simplify(x = gsea, cutoff = sim_cutoff)
+  
+  gsea_list_simple[[name]] <- pairwise_termsim(gsea_new)
+  
+}
+  
+  return(gsea_list_simple)
+  
+}
+
+
+gsea_simple_df <- function(gsea_simple_list, topcat=5000, jacc_ord = FALSE){
+  set.seed(12345)
+
+  simple_df <- list()
+  
+  
+      
+    for (i in seq_along(gsea_simple_list)){
+      x <- gsea_simple_list[[i]]
+      name <- names(gsea_simple_list)[[i]]
+      fortify_df <- fortify(x,showCategory=topcat)
+        
+      
+    if (jacc_ord && !is.null(x@termsim) && nrow(x@termsim) >= 2) {
+      # Compute Jaccard similarity ordering
+      jaccard_similarity_matrix <- x@termsim
+      # Convert the Jaccard similarity matrix to a distance matrix
+      jaccard_distance_matrix <- 1 - jaccard_similarity_matrix
+      
+      hclust_result <- hclust(dist(jaccard_distance_matrix))
+      order_of_terms <- hclust_result$order
+      labels <- hclust_result$labels[order_of_terms]
+      fortify_df$Description <- factor(fortify_df$Description, levels = labels)
+    } else {
+      # Keep the original order
+      fortify_df$Description <- factor(fortify_df$Description, levels = fortify_df$Description)
+    }
+
+    write.csv(fortify_df,file=paste0("~/GO/",name,"_F.csv"))
+    
+     simple_df[[name]]<-fortify_df
+    }
+  
+  
+  
+  return(simple_df)
+}
+
+
+
+```
+
+
+```{r}
+run_glmnet_nestedcv<- function(X, y, alpha = 1,outer_folds = 5, inner_folds = 3) {
+  set.seed(12345)
+  # Create outer folds
+  outer_cv <- createFolds(Y, k = outer_folds, list = TRUE, returnTrain = TRUE)
+  
+  outer_auc <- numeric(length(outer_cv))
+  all_preds <- list()
+  feature_list <- list()
+  importance_matrix <- matrix(0, nrow = length(outer_cv), ncol = ncol(X))
+  colnames(importance_matrix) <- colnames(X)
+  
+  
+  for (i in seq_along(outer_cv)) {
+  cat("Outer fold", i, "of", outer_folds, "\n")
+  
+  train_idx <- outer_cv[[i]]
+  test_idx  <- setdiff(seq_along(Y), train_idx)
+  
+  X_train <- as.matrix(X[train_idx, ])
+  Y_train <- Y[train_idx]
+  X_test  <- as.matrix(X[test_idx, ])
+  Y_test  <- Y[test_idx]
+  
+    # 3-fold CV with 5 repeats
+    ctrl <- trainControl(
+      method = "repeatedcv",
+      number = inner_folds,
+      repeats = 5,
+      classProbs = TRUE,
+      summaryFunction = twoClassSummary
+    )
+    
+    set.seed(i)
+    # Train model
+    model <- train(
+      x = X_train,
+      y = as.factor(Y_train),
+      method = "glmnet",
+      trControl = ctrl,
+      tuneGrid = expand.grid(alpha = alpha, lambda = 10^seq(-3, 0, length = 20)),
+      metric = "ROC"
+    )
+    
+    # --- Predict on outer test fold ---
+    pred_prob <- predict(model, X_test, type = "prob")[, 2]
+    roc_obj <- roc(Y_test, pred_prob)
+    auc_val <- auc(roc_obj)
+    outer_auc[i] <- auc_val
+    
+    # --- Store individual ROC data for later plotting ---
+    roc_df <- data.frame(
+      fold = i,
+      sensitivity = roc_obj$sensitivities,
+      one_minus_spec = 1 - roc_obj$specificities
+    )
+    all_preds[[i]] <- data.frame(
+      fold = i,
+      true_label = Y_test,
+      pred_prob = pred_prob
+    )
+  
+    # --- Extract coefficients (non-zero only) ---
+    best_lambda <- model$bestTune$lambda
+    final_fit <- glmnet(X_train, Y_train, alpha = alpha, family = "binomial", lambda = best_lambda)
+    coefs <- as.matrix(coef(final_fit))
+    nonzero <- rownames(coefs)[coefs != 0]
+    nonzero <- nonzero[nonzero != "(Intercept)"]
+    
+    # --- Save feature list ---
+    feature_list[[i]] <- data.frame(feature = nonzero, coef = as.numeric(coefs[nonzero, ]))
+    
+    # --- Store importance ---
+    imp <- varImp(model)$importance
+    matched_imp <- imp[match(colnames(X), rownames(imp)), 1]
+    importance_matrix[i, ] <- ifelse(is.na(matched_imp), 0, matched_imp)
+  }
+  
+  # --- Feature stability ---
+  feature_stability <- bind_rows(feature_list) %>%
+    group_by(feature) %>%
+    summarise(
+      selection_freq = n() / length(outer_cv),
+      mean_coef = mean(coef)
+    ) %>%
+    arrange(desc(selection_freq))
+  
+  # --- Combine importance ---
+  importance_df <- data.frame(
+    feature = colnames(X),
+    mean_importance = colMeans(importance_matrix),
+    importance_sd = apply(importance_matrix, 2, sd)
+  )
+  
+  feature_stability <- merge(feature_stability, importance_df, by = "feature", all.x = TRUE)
+  
+  # --- Combine all predictions ---
+  all_preds_df <- bind_rows(all_preds)
+  
+  # --- Return results ---
+  list(
+    auc = mean(outer_auc),
+    auc_sd = sd(outer_auc),
+    outer_auc = outer_auc,
+    feature_stability = feature_stability,
+    all_preds = all_preds_df
+  )
+}
+
+
+
+
+run_rf_boruta_nestedcv<- function(X, Y, outer_folds = 5, inner_folds = 3) {
+  
+  set.seed(12345)
+  # Create outer folds
+  outer_cv <- createFolds(Y, k = outer_folds, list = TRUE, returnTrain = TRUE)
+  
+  
+  outer_auc <- numeric(length(outer_cv))
+  all_preds <- list()
+  feature_list <- list()
+
+  importance_matrix <- matrix(0, nrow = length(outer_cv), ncol = ncol(X))
+  mda_matrix <- matrix(0, nrow = length(outer_cv), ncol = ncol(X))
+  gini_matrix <- matrix(0, nrow = length(outer_cv), ncol = ncol(X))
+  colnames(importance_matrix) <- colnames(X)
+  colnames(mda_matrix) <- colnames(X)
+  colnames(gini_matrix) <- colnames(X)
+
+  
+  for (i in seq_along(outer_cv)) {
+  cat("Outer fold", i, "of", outer_folds, "\n")
+  
+  train_idx <- outer_cv[[i]]
+  test_idx  <- setdiff(seq_along(Y), train_idx)
+  
+  X_train <- as.matrix(X[train_idx, ])
+  Y_train <- Y[train_idx]
+  X_test  <- as.matrix(X[test_idx, ])
+  Y_test  <- Y[test_idx]
+  
+    # 3-fold CV with 5 repeats with Boruta feature selection (ONLY on training data)
+    set.seed(i) # For reproducibility
+    boruta <- Boruta(X_train, as.factor(Y_train), maxRuns = 50) 
+    selected_features <- getSelectedAttributes(boruta, withTentative = TRUE)
+    
+    X_train_boruta <- X_train[, selected_features, drop = FALSE]
+    X_test_boruta  <- X_test[, selected_features, drop = FALSE]
+    
+    # 3. Train RF on Boruta-selected features
+    ctrl <- trainControl(
+      method = "none",  # no resampling; rely on OOB
+       classProbs = TRUE,
+      summaryFunction = twoClassSummary
+      )
+    
+    p <- length(selected_features)
+
+
+    model <- train(
+      x = X_train_boruta,
+      y = make.names(Y_train), # caret requires valid factor names
+      method = "rf",
+      trControl = ctrl,
+      tuneGrid = data.frame(mtry = floor(sqrt(ncol(X)))),
+      metric = "ROC",
+      importance = TRUE
+    )
+    
+    
+    # --- Predict on outer test fold ---
+    pred_prob <- predict(model, X_test_boruta, type = "prob")[, 2]
+    roc_obj <- roc(Y_test, pred_prob)
+    auc_val <- auc(roc_obj)
+    outer_auc[i] <- auc_val
+    
+    # --- Store individual ROC data for later plotting ---
+    roc_df <- data.frame(
+      fold = i,
+      sensitivity = roc_obj$sensitivities,
+      one_minus_spec = 1 - roc_obj$specificities
+    )
+    
+    # --- Save predictions ---
+    all_preds[[i]] <- data.frame(
+      fold = i,
+      true_label = Y_test,
+      pred_prob = pred_prob
+    )
+  
+
+    # --- Save feature list ---
+    feature_list[[i]] <- data.frame(feature = selected_features)
+    
+
+    # SAFELY store variable importance
+    imp <- varImp(model)$importance
+    
+    mda  <- importance(model$finalModel)[,"MeanDecreaseAccuracy"]
+    gini <- importance(model$finalModel)[,"MeanDecreaseGini"]
+    
+    matched_imp <- imp[match(colnames(X), rownames(imp)), 1]
+    matched_mda <-  mda[match(colnames(X), names(mda))]
+    matched_gini <- gini[match(colnames(X), names(gini))]
+    
+    importance_matrix[i, ] <- ifelse(is.na(matched_imp), 0, matched_imp)
+    mda_matrix[i, ] <- ifelse(is.na(matched_mda), 0, matched_mda)
+    gini_matrix[i, ] <- ifelse(is.na(matched_gini), 0, matched_gini)
+    
+  }
+
+  
+  # --- Feature stability ---
+  feature_stability <- bind_rows(feature_list) %>%
+    group_by(feature) %>%
+    summarise(selection_freq = n() / length(outer_cv)) %>%
+    arrange(desc(selection_freq))
+  
+  # --- Combine importance ---
+  importance_df <- data.frame(
+    feature = colnames(X),
+    mean_importance = colMeans(importance_matrix),
+    importance_sd = apply(importance_matrix, 2, sd),
+    Mean_MDA = colMeans(mda_matrix, na.rm = TRUE),
+    SD_MDA = apply(mda_matrix, 2, sd, na.rm = TRUE),
+    Mean_Gini = colMeans(gini_matrix, na.rm = TRUE),
+    SD_Gini = apply(gini_matrix, 2, sd, na.rm = TRUE)
+  )
+  
+  feature_stability <- merge(feature_stability, importance_df, by = "feature", all.x = TRUE)
+  
+  # --- Combine all predictions ---
+  all_preds_df <- bind_rows(all_preds)
+  
+  # --- Return results ---
+  list(
+    auc = mean(outer_auc),
+    auc_sd = sd(outer_auc),
+    outer_auc = outer_auc,
+    feature_stability = feature_stability,
+    all_preds = all_preds_df
+  )
+}
+
+
+
+plot_rocs <- function(lasso_res) {
+  roc_data <- lasso_res$all_preds
+
+  # Initialize ggplot
+  p <- ggplot() +
+    # Add reference line
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "black")
+
+  # Plot individual outer fold ROC curves
+  for (i in unique(roc_data$fold)) {
+    fold_data <- roc_data[roc_data$fold == i, ]
+    fold_roc <- roc(fold_data$true_label, fold_data$pred_prob)
+
+    fold_df <- data.frame(
+      x = 1 - rev(fold_roc$specificities),  # ascending 1 - specificity
+      y = rev(fold_roc$sensitivities)       # ascending sensitivity
+    )
+
+    p <- p + geom_step(
+      data = fold_df,
+      aes(x = x, y = y),
+      color = "pink",
+      alpha = 0.8,
+      linewidth = 0.7
+    )
+  }
+
+  # Plot overall ROC (all outer folds combined)
+  overall_roc <- roc(roc_data$true_label, roc_data$pred_prob)
+  overall_df <- data.frame(
+    x = 1 - rev(overall_roc$specificities),
+    y = rev(overall_roc$sensitivities)
+  )
+
+  set.seed(12345)
+  ci_auc <- ci.auc(overall_roc, method = "bootstrap")
+
+  p <- p + geom_step(
+    data = overall_df,
+    aes(x = x, y = y),
+    color = "red",
+    linewidth = 1
+  ) +
+    labs(
+      title = "Nested CV ROC Curve",
+      subtitle = sprintf("AUC = %.3f (95%% CI: %.3f–%.3f)",
+                         auc(overall_roc), ci_auc[1], ci_auc[3]),
+      x = "1 - Specificity",
+      y = "Sensitivity"
+    ) +
+    coord_equal() +
+    theme_minimal()
+
+  return(p)
+}
+
+```
+
+
+load necessary files and convert columns to factors or numbers etc as needed (usually need as factors). If you have continous variables, suggested to break up into meaningful bins, unless each continous change is specifically meaningful. Age for example I brokeup into 4 groups of roughly 10 years.  
+```{r files, echo=FALSE}
+Cardiocondition=read_excel("~/CardioCondition.xlsx")
+Cardiocounts1=read.delim("~/UniqueCardioCounts.txt",row.names = 1)
+Cardiocounts2=read.delim("~/UniqueCardioCounts2.txt",row.names = 1)
+Cardiocounts3=read.delim("~/UniqueCardioCounts_batch3.txt",row.names = 1)
+Cardiocounts4=read.delim("~/UniqueCardioCounts_batch4.txt",row.names = 1)
+Cardiocounts1=Cardiocounts1[-c(1:5)]
+Cardiocounts2=Cardiocounts2[-c(1:5)]
+Cardiocounts3=Cardiocounts3[-c(1:5)]
+Cardiocounts4=Cardiocounts4[-c(1:5)]
+
+Cardiocountsonly=merge(Cardiocounts1,Cardiocounts2,by="row.names",all=T)
+rownames(Cardiocountsonly)=Cardiocountsonly$Row.names
+Cardiocountsonly=merge(Cardiocountsonly,Cardiocounts3,by="row.names",all=T)
+rownames(Cardiocountsonly)=Cardiocountsonly$Row.names
+Cardiocountsonly=merge(Cardiocountsonly,Cardiocounts4,by="row.names",all=T)
+rownames(Cardiocountsonly)=Cardiocountsonly$Row.names
+Cardiocountsonly=Cardiocountsonly[-c(1:3)]
+
+Cardiocountsonly <- Cardiocountsonly %>%
+  rename(X9994.1 = X9994.2)
+
+Cardioinfo=Cardiocondition
+
+Cardioinfo<- Cardioinfo %>%
+  mutate(across(where(is.character), ~na_if(trimws(.), "")),
+         across(where(is.character), ~na_if(., "NA")), 
+         across(where(is.character), ~na_if(., "Inf")),
+         across(where(is.numeric), ~ ifelse(is.infinite(.), NA, .)),
+         across(where(is.numeric), ~ifelse(. == "", NA, as.numeric(.))))
+
+Cardioinfo<- Cardioinfo %>% mutate(
+  Group2 = case_when(Group == "AB1" ~ "AB1.B2",
+                    Group == "AB2" ~ "AB1.B2",
+                    Group == "B1B2" ~ "B1B2.C.D",
+                    Group == "B1C.D" ~ "B1B2.C.D",
+                    TRUE ~ Group))
+
+Cardioinfo$rin <- Cardioinfo$RIN
+
+
+numeric_col = c("age","Gap","BMI","cardiac_freq","echo_ven_iz_di","echo_ven_iz_si","echo_tapse","echo_sep_iv_gr","echo_par_po","EF","echo_con_strain","RWT","LVMI","SeqOrder")
+Cardioinfo[numeric_col]<- lapply(Cardioinfo[numeric_col],as.numeric)
+
+Cardioinfo <- Cardioinfo[order(Cardioinfo$SeqOrder),]
+
+
+
+Cardioinfo$AgeRange <- cut(
+  Cardioinfo$age, 
+  breaks = c(-Inf, 49, 50, 69, Inf), 
+  labels = c("<40", "50-59", "60-69", ">=70"),
+  right = TRUE
+)
+Cardioinfo$AgeCategory=Cardioinfo$AgeRange
+levels(Cardioinfo$AgeCategory)=c("Young", "Mid","Old","Oldest")
+
+Cardioinfo$Gap <- round(Cardioinfo$Gap)
+Cardioinfo$Gap <- as.numeric(Cardioinfo$Gap)
+  
+
+factor_cols <- c("Sex", "Time","Group2", "Patient","Category","SeqBatch","Media","AgeCategory","Infected","Group","Gap","Afib","pvc","Aflutter","VT","OtherArrhythmia","RBBB","LBBB","LAFB","LPFB","IVCD","firstdegreeAV","seconddegreeAV1","seconddegreeAV2","thirddegreeAV","sinusPause","echo_marcapasos","dop_val_reg_tri","dop_val_reg_mi","dop_val_reg_pulm","dop_val_reg_ao","dop_val_est_tri","dop_val_est_mi","dop_val_est_pulm","dop_val_est_ao","echo_mot_seg_norm","tromb_intracav","echo_dil_lv","echo_dil_rv","echo_dil_la","echo_dil_ra","Diastolic_Dysfunction_aseecho")
+Cardioinfo[factor_cols]<- lapply(Cardioinfo[factor_cols],factor)
+Cardioinfo <- Cardioinfo %>% arrange(SeqOrder)
+
+```
+
+remove rRNA and pseudogene counts. host = "https://www.ensembl.org",
+```{r}
+ensembl <- useEnsembl(biomart = "genes", dataset = "hsapiens_gene_ensembl", host = "https://www.ensembl.org")
+
+rRNAs=biomaRt::getBM(values="rRNA", 
+               filters="biotype", 
+               attributes=c("ensembl_gene_id", "external_gene_name", "gene_biotype"), 
+               mart = ensembl)
+
+biotypes <- getBM(
+  attributes = "gene_biotype",
+  mart = ensembl
+)
+
+pseudogene_types <- grep("pseudogene",biotypes$gene_biotype, value=TRUE)
+pseudogenes=biomaRt::getBM(values=pseudogene_types, 
+               filters="biotype", 
+               attributes=c("ensembl_gene_id", "external_gene_name", "gene_biotype"), 
+               mart = ensembl)
+
+Cardiocountsonly=Cardiocountsonly[!(row.names(Cardiocountsonly) %in% c(rRNAs$ensembl_gene_id,pseudogenes$ensembl_gene_id)),]
+```
+removes 48 ensemble gene IDs corresponding to rRNAs
+
+```{r}
+Cardioinfo=subset(Cardioinfo, Group2 %in% c("AA","B1B1","AB1.B2","B1B2.C.D") & SeqBatch!="NA")
+Cardioinfo$Group2  <- droplevels(Cardioinfo$Group2)
+
+
+Cardiocountsonly=subset(Cardiocountsonly, select=Cardioinfo$Code)
+Cardioinfo=as.data.frame(Cardioinfo)
+Cardiocountsonly=as.data.frame(Cardiocountsonly)
+```
+
+# Both sexes
+
+## AA v AB / AC
+
+### Demographics
+
+```{r}
+demo_vars <- c("time_to_prog","age","Media","BMI","HTN","Diabetes")
+
+
+
+ekg_vars <- c("cardiac_freq","Afib","pvc","Aflutter","VT","OtherArrhythmia","RBBB","LBBB","LAFB","LPFB","IVCD","firstdegreeAV","seconddegreeAV1","seconddegreeAV2","thirddegreeAV","sinusPause","LVH","STchange","LowVoltage","Paced")
+
+
+# not including ai_vol,"echo_marcapasos", "echo_tr_psap", since only <50% available
+echo_vars <- c("dop_val_reg_tri","dop_val_reg_mi","dop_val_reg_pulm","dop_val_reg_ao","dop_val_est_tri","dop_val_est_mi","dop_val_est_pulm","dop_val_est_ao","echo_ven_iz_di","echo_ven_iz_si","echo_sep_iv_gr","echo_par_po","RWT","LVMI","echo_tapse","EF","echo_mot_seg_norm","tromb_intracav","echo_dil_lv","echo_dil_rv","echo_dil_la","echo_dil_ra","Diastolic_Dysfunction_aseecho")
+
+
+dil_vars <- c("echo_dil_lv", "echo_dil_rv", "echo_dil_la", "echo_dil_ra")
+
+Cardioinfo[dil_vars] <- lapply(
+  Cardioinfo[dil_vars],
+  function(x) {
+    x <- as.numeric(as.character(x))
+    x[is.na(x)] <- 0
+    x
+  }
+)
+```
+
+
+
+```{r , echo=FALSE}
+CardioProg_A_B=subset(Cardioinfo,Time=="1" & Infected=="Pos" & (Group=="AA"|Group=="AB1"|Group=="AB2"|Group=="AC.D"))
+
+CardioProg_A_B$Group=droplevels(CardioProg_A_B$Group)
+Counts_Prog_A_B=subset(Cardiocountsonly, select=CardioProg_A_B$Code)
+
+
+library(tableone)
+
+
+#check normality
+numeric_vars <- c("BMI", "age", "time_to_prog")
+
+norm_AB <-list()
+for (x in numeric_vars){
+  norm_AB[[x]] <-shapiro.test(CardioProg_A_B[[x]])
+  
+  hist(CardioProg_A_B[[x]], main = paste0("histogram of ",x))
+}
+
+## none are normal
+
+```
+
+```{r}
+demo_tables_by_sex_A_B <- lapply(
+  split(CardioProg_A_B, CardioProg_A_B$Sex),
+  function(df) {
+    CreateTableOne(
+      data   = df,
+      strata = "Group2",
+      vars   = demo_vars #"echo_con_strain"
+    )
+  }
+)
+
+
+
+demo_A_B_mat_all <- cbind( print(
+  demo_tables_by_sex_A_B[["F"]],
+  format = "fp",
+  showAllLevels = TRUE,
+  quote = FALSE,
+  nonnormal = numeric_vars,
+  exact = c( "Media","HTN" ,"Diabetes" ),
+  noSpaces = TRUE
+),
+print(
+  demo_tables_by_sex_A_B[["M"]],
+  format = "fp",
+  showAllLevels = TRUE,
+  quote = FALSE,
+  nonnormal = numeric_vars,
+  exact = c( "Media","HTN" ,"Diabetes" ),
+  noSpaces = TRUE
+))
+
+
+
+
+write.csv(demo_A_B_mat_all, "~/Demographics/AAvAB_demographics_table1.csv")
+
+
+
+missing_long_demo_A_B <- CardioProg_A_B %>%
+  dplyr::select(Group2, Sex, all_of(demo_vars)) %>%
+  mutate(across(all_of(demo_vars), as.character)) %>%
+  pivot_longer(
+    cols = all_of(demo_vars),
+    names_to = "Variable",
+    values_to = "value"
+  ) %>%
+  group_by(Group2, Sex, Variable) %>%
+  summarise(
+    n = sum(is.na(value)),
+    pct = mean(is.na(value)) * 100,
+    .groups = "drop"
+  )
+
+missing_long_demo_A_B <- missing_long_demo_A_B %>%
+  mutate(missing = sprintf("%d (%.1f%%)", n, pct))
+
+missing_table_demo_A_B <- missing_long_demo_A_B %>%
+  tidyr::unite("Group", Group2, Sex, sep = "_") %>%
+  dplyr::select(Variable, Group, missing) %>%
+  pivot_wider(
+    names_from = Group,
+    values_from = missing
+  )
+
+write.csv(missing_table_demo_A_B, "~/Demographics/AAvAB_demo_missing_table1.csv")
+```
+
+### PCA
+
+
+```{r }
+CardioProg_A_B <- droplevels(CardioProg_A_B)
+
+ddsProg_A_B=DESeqDataSetFromMatrix(countData = Counts_Prog_A_B, 
+        colData =CardioProg_A_B, design= ~  Media + SeqBatch +  Group2 + Sex + Group2:Sex)
+keepddsProg_A_B= rowSums(counts(ddsProg_A_B)>= 10) >=9 #keeps genes with at least 9 samples with 10 counts
+ddsProg_A_B <- ddsProg_A_B[keepddsProg_A_B,]
+```
+
+For PCA plots you need to normalize. Can be done with rld or vst. You can plot to see which is best. Want to see a fairly even line along x=y. rlog seems to work a bit better but is VERY slow with many samples so I did vst.
+
+These techniques use compute a variance stabilizing transformation which is roughly similar to putting the data on the log2 scale, while also dealing with the sampling variability of low counts. It uses the design formula to calculate the within-group variability (if blind=FALSE), but it does not use the design to remove variation in the data
+
+```{r , message=FALSE}
+vstProg_A_B <- vst(ddsProg_A_B, blind = FALSE)
+```
+
+```{r,message=FALSE}
+
+rv_Prog_A_B <- rowVars(assay(vstProg_A_B))
+pcagenes_Prog_A_B <-  order(rv_Prog_A_B, decreasing=TRUE)[seq_len(min(500, length(rv_Prog_A_B)))]
+pca_Prog_A_B <- prcomp(t(assay(vstProg_A_B)[pcagenes_Prog_A_B,]))
+percentVar_Prog_A_B <- pca_Prog_A_B$sdev^2 / sum( pca_Prog_A_B$sdev^2 )
+
+
+autoplot(pca_Prog_A_B, x=1, y=2, data=CardioProg_A_B, colour="Sex") + theme_classic()
+ggsave(filename="~/Images/PCA/PCA1_2_Sex_Prog_A_B.pdf", height=3, width=4)
+
+autoplot(pca_Prog_A_B, x=1, y=2, data=CardioProg_A_B, colour="Media")+ theme_classic() + scale_color_manual(values = c("purple","steelblue3"))
+ggsave(filename="~/Images/PCA/PCA1_2_Media_Prog_A_B.pdf", height=3, width=4.1)
+
+autoplot(pca_Prog_A_B, x=3, y=4, data=CardioProg_A_B, colour="SeqBatch")+ theme_classic() + scale_color_manual(values = c("orange","turquoise4","violetred4"))
+ggsave(filename="~/Images/PCA/PCA3_4_SeqBatch_Prog_A_B.pdf", height=3, width=4.5)
+
+
+```
+
+### Cross-validation
+
+first remove bathc effects using combat-seq
+
+In ComBat-seq, user may specify biological covariates, whose signals will be preserved in the adjusted data. If the user would like to specify one biological variable, they may use the group parameter:
+
+ 
+```{r}
+
+adj_Counts_Prog_A_B <- ComBat_seq(as.matrix(Counts_Prog_A_B), batch=CardioProg_A_B$SeqBatch, group=CardioProg_A_B$Group2)
+
+
+dds_forest_A_B <- DESeqDataSetFromMatrix(
+  countData = adj_Counts_Prog_A_B,  # Batch-corrected counts
+  colData = CardioProg_A_B,
+  design = ~ 1            # Primary variable of interest (progressors vs. non-progressors)
+)
+
+keepdds_forest_A_B= rowSums(counts(dds_forest_A_B)>= 10) >=9
+dds_forest_A_B <- dds_forest_A_B[keepdds_forest_A_B,]
+dds_forest_A_B <- DESeq(dds_forest_A_B)
+vst_forest_A_B <- vst(dds_forest_A_B, blind = FALSE)
+
+
+
+vst_forest_A_B_matrix<-assay(vst_forest_A_B)
+gene_vars_A_B <- apply(vst_forest_A_B_matrix, 1, var)
+vst_forest_A_B_top <- vst_forest_A_B_matrix[gene_vars_A_B > quantile(gene_vars_A_B, 0.4), ]
+```
+
+
+lasso nested repeated cross-validation for training and validaiton
+
+```{r}
+
+library(caret)
+library(glmnet)
+library(pROC)
+
+set.seed(12345)
+# Create k outer folds
+X <- as.matrix(t(vst_forest_A_B_top))  # Ensure it's a matrix (genes as columns, samples as rows)
+Y <- factor(CardioProg_A_B$Group2)  # Ensure it's a factor (0 = non-progressor, 1 = progressor)
+
+```
+
+
+```{r, fig.width=4.5, fig.height=4.0}
+
+lasso_nested_A_B <- run_glmnet_nestedcv(X, Y, alpha = 1, outer_folds = 4, inner_folds = 3)
+
+
+
+lasso_features_A_B_sig<-lasso_nested_A_B$feature_stability
+lasso_features_A_B_sig<- subset(lasso_features_A_B_sig, selection_freq > 0)
+
+
+lasso_features_A_B_sig = annotate_ML(lasso_features_A_B_sig,ensembl)
+
+
+lasso_features_A_B_sig <- lasso_features_A_B_sig[
+  order(lasso_features_A_B_sig$mean_importance, decreasing = TRUE), ]
+
+write.csv(lasso_features_A_B_sig,file="~/ML/lasso_features_A_B_sig_all.csv")
+
+ggplot(lasso_features_A_B_sig[1:30,], aes(x = reorder(external_gene_name, mean_importance), y = mean_importance)) +
+  geom_col(aes(fill = selection_freq)) +
+  #geom_errorbar(aes(ymin = mean_importance - importance_sd, ymax = mean_importance + importance_sd),width = 0.2, color = "black") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue", name = "selection_freq") +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "Mean Importance",
+    title = "Top 30 Lasso"
+  ) +
+  theme_minimal()
+
+
+
+
+# Outer loop performance
+cat("Mean outer AUC:", round(mean(lasso_nested_A_B$outer_auc), 3),
+    "±", round(sd(lasso_nested_A_B$outer_auc), 3), "\n")
+
+
+
+
+
+ggsave(filename="~/ML/top30_lasso_AvB_all.pdf",width = 4.5, height=4) 
+
+# ROC plot (using your existing function)
+plot_rocs(lasso_nested_A_B)
+
+ggsave(filename="~/ML/roc_lasso_AvB_all.pdf",width = 4, height=4.2) 
+```
+
+elastic net
+
+```{r, fig.width=4.5, fig.height =4}
+
+
+
+enet_nested_A_B <- run_glmnet_nestedcv(X, Y, alpha = 0.5, outer_folds = 4, inner_folds = 3)
+
+
+
+enet_features_A_B_sig<-enet_nested_A_B$feature_stability
+enet_features_A_B_sig<- subset(enet_features_A_B_sig, selection_freq > 0)
+
+enet_features_A_B_sig = annotate_ML(enet_features_A_B_sig,ensembl)
+
+
+enet_features_A_B_sig <- enet_features_A_B_sig[
+  order(enet_features_A_B_sig$mean_importance, decreasing = TRUE), ]
+
+write.csv(enet_features_A_B_sig,file="~/ML/enet_features_A_B_sig_all.csv")
+
+ggplot(enet_features_A_B_sig[1:30,], aes(x = reorder(external_gene_name, mean_importance), y = mean_importance)) +
+  geom_col(aes(fill = selection_freq)) +
+  #geom_errorbar(aes(ymin = mean_importance - importance_sd, ymax = mean_importance + importance_sd),width = 0.2, color = "black") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue", name = "selection_freq") +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "Mean Importance",
+    title = "Top30 Elastic Net"
+  ) +
+  theme_minimal()
+
+
+# Outer loop performance
+cat("Mean outer AUC:", round(mean(enet_nested_A_B$outer_auc), 3),
+    "±", round(sd(enet_nested_A_B$outer_auc), 3), "\n")
+
+
+
+ggsave(filename="~/ML/top30_enet_AvB_all.pdf",width = 4.5, height=4) 
+
+# ROC plot (using your existing function)
+plot_rocs(enet_nested_A_B)
+
+ggsave(filename="~/ML/roc_enet_AvB_all.pdf",width = 4, height=4.2) 
+```
+
+Random forest
+
+```{r}
+
+# Run Random Forest (should now work without errors)
+
+rf_results_A_B <- run_rf_boruta_nestedcv(t(vst_forest_A_B_top) , Y, outer_folds = 4, inner_folds =3)
+
+top_rf_features_A_B_sig = subset(rf_results_A_B$feature_stability, selection_freq > 0)
+
+top_rf_features_A_B_sig = annotate_ML(top_rf_features_A_B_sig,ensembl)
+
+
+top_rf_features_A_B_sig <- top_rf_features_A_B_sig[
+  order(top_rf_features_A_B_sig$mean_importance, decreasing = TRUE), ]
+
+write.csv(top_rf_features_A_B_sig,file="~/ML/rf_features_A_B_sig_all.csv")
+```
+
+```{r, fig.width = 4.5, fig.height=4}
+
+
+ggplot(top_rf_features_A_B_sig[1:30,], aes(x = reorder(external_gene_name, mean_importance), y = mean_importance)) +
+  geom_col(aes(fill =selection_freq)) +
+  #geom_errorbar(aes(ymin = mean_importance - importance_sd, ymax = mean_importance + importance_sd), width = 0.2, color = "black") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue", name = "selection frequency") +
+  coord_flip() +
+  labs(
+    y = "Mean importance",
+    x = NULL,
+    title = "Top30 Random Forest"
+  ) +
+  theme_minimal()
+
+ggsave(filename="~/ML/top30_rf_A_B_all.pdf",width = 4.5, height=4) 
+
+# ROC plot (using your existing function)
+plot_rocs(rf_results_A_B)
+
+ggsave(filename="~/ML/roc_rf_A_B_all.pdf",width = 4, height=4.2) 
+```
+
+## BB v B2 / BC
+
+### Demographics
+```{r}
+CardioProg_B_CD=subset(Cardioinfo,Time=="1" & Infected=="Pos" & Group2 %in% c("B1B1","B1B2.C.D") )
+CardioProg_B_CD$Group2=droplevels(CardioProg_B_CD$Group2)
+Counts_Prog_B_CD=subset(Cardiocountsonly, select=CardioProg_B_CD$Code)
+
+
+
+#check normality
+numeric_vars <- c("BMI", "age", "time_to_prog")
+
+norm_B_CD <-list()
+for (x in numeric_vars){
+  norm_B_CD[[x]] <-shapiro.test(CardioProg_B_CD[[x]])
+  
+  hist(CardioProg_B_CD[[x]], main = paste0("histogram of ",x))
+}
+
+## age is normal, bmi is borderline, time to prog is definitely not
+```
+
+```{r}
+
+demo_tables_by_sex_B_CD <- lapply(
+  split(CardioProg_B_CD, CardioProg_B_CD$Sex),
+  function(df) {
+    CreateTableOne(
+      data   = df,
+      strata = "Group2",
+      vars   = demo_vars #"echo_con_strain"
+    )
+  }
+)
+
+
+
+demo_B_CD_mat_all <- cbind( print(
+  demo_tables_by_sex_B_CD[["F"]],
+  format = "fp",
+  showAllLevels = TRUE,
+  quote = FALSE,
+  nonnormal = c("BMI" ,"time_to_prog"),
+  exact = c( "Media","HTN" ,"Diabetes" ),
+  noSpaces = TRUE
+),
+print(
+  demo_tables_by_sex_B_CD[["M"]],
+  format = "fp",
+  showAllLevels = TRUE,
+  quote = FALSE,
+  nonnormal = c("BMI" ,"time_to_prog"),
+  exact = c( "Media","HTN" ,"Diabetes" ),
+  noSpaces = TRUE
+))
+
+
+
+
+write.csv(demo_B_CD_mat_all, "~/Demographics/BBvBCD_demographics_table1.csv")
+
+
+
+missing_long_demo_B_CD <- CardioProg_B_CD %>%
+  dplyr::select(Group2, Sex, all_of(demo_vars)) %>%
+  mutate(across(all_of(demo_vars), as.character)) %>%
+  pivot_longer(
+    cols = all_of(demo_vars),
+    names_to = "Variable",
+    values_to = "value"
+  ) %>%
+  group_by(Group2, Sex, Variable) %>%
+  summarise(
+    n = sum(is.na(value)),
+    pct = mean(is.na(value)) * 100,
+    .groups = "drop"
+  )
+
+missing_long_demo_B_CD <- missing_long_demo_B_CD %>%
+  mutate(missing = sprintf("%d (%.1f%%)", n, pct))
+
+missing_table_demo_B_CD <- missing_long_demo_B_CD %>%
+  tidyr::unite("Group", Group2, Sex, sep = "_") %>%
+  dplyr::select(Variable, Group, missing) %>%
+  pivot_wider(
+    names_from = Group,
+    values_from = missing
+  )
+
+write.csv(missing_table_demo_B_CD, "~/Demographics/BBvBCD_demo_missing_table1.csv")
+```
+
+### PCA
+
+
+```{r designProgressors}
+CardioProg_B_CD <- droplevels(CardioProg_B_CD)
+
+ddsProg_B_CD=DESeqDataSetFromMatrix(countData = Counts_Prog_B_CD, 
+        colData =CardioProg_B_CD, design= ~ SeqBatch + Media + Group2 + Sex + Group2:Sex)
+keepddsProg_B_CD= rowSums(counts(ddsProg_B_CD)>= 10) >=3 #keeps genes with at least 3 samples with 10 counts
+ddsProg_B_CD <- ddsProg_B_CD[keepddsProg_B_CD,]
+
+```
+
+
+
+```{r vstProg_A_Bressors, message=FALSE}
+vstProg_B_CD <- vst(ddsProg_B_CD, blind = FALSE)
+
+```
+
+```{r pcaProgressors, message=FALSE}
+
+rv_Prog_B_CD <- rowVars(assay(vstProg_B_CD))
+pcagenes_Prog_B_CD <-  order(rv_Prog_B_CD, decreasing=TRUE)[seq_len(min(500, length(rv_Prog_B_CD)))]
+pca_Prog_B_CD <- prcomp(t(assay(vstProg_B_CD)[pcagenes_Prog_B_CD,]))
+percentVar_Prog_B_CD <- pca_Prog_B_CD$sdev^2 / sum( pca_Prog_B_CD$sdev^2 )
+
+
+
+autoplot(pca_Prog_B_CD, x=1, y=2, data=CardioProg_B_CD, colour="Sex") + theme_classic()
+ggsave(filename="~/Images/PCA/PCA1_2_Sex_Prog_B_CD.pdf", height=3, width=4)
+
+autoplot(pca_Prog_B_CD, x=1, y=2, data=CardioProg_B_CD, colour="Media")+ theme_classic() + scale_color_manual(values = c("purple","steelblue3"))
+ggsave(filename="~/Images/PCA/PCA1_2_Media_Prog_B_CD.pdf", height=3, width=4.1)
+
+autoplot(pca_Prog_B_CD, x=1, y=2, data=CardioProg_B_CD, colour="SeqBatch")+ theme_classic() + scale_color_manual(values = c("green3","violetred4"))
+ggsave(filename="~/Images/PCA/PCA1_2_SeqBatch_Prog_B_CD.pdf", height=3, width=4.3)
+
+
+```
+
+
+### Cross-validation
+
+first remove bathc effects using combat-seq
+
+In ComBat-seq, user may specify biological covariates, whose signals will be preserved in the adjusted data. If the user would like to specify one biological variable, they may use the group parameter:
+ 
+```{r}
+
+adj_Counts_Prog_B_CD <- ComBat_seq(as.matrix(Counts_Prog_B_CD), batch=CardioProg_B_CD$SeqBatch, group=CardioProg_B_CD$Group2)
+
+
+
+dds_forest_B_CD <- DESeqDataSetFromMatrix(
+  countData = adj_Counts_Prog_B_CD,  # Batch-corrected counts
+  colData = CardioProg_B_CD,
+  design = ~ 1             # Primary variable of interest (progressors vs. non-progressors)
+)
+
+keepdds_forest_B_CD= rowSums(counts(dds_forest_B_CD)>= 10) >=9
+dds_forest_B_CD <- dds_forest_B_CD[keepdds_forest_B_CD,]
+dds_forest_B_CD <- DESeq(dds_forest_B_CD)
+
+vst_forest_B_CD <- vst(dds_forest_B_CD, blind = FALSE)
+vst_forest_B_CD_matrix<-assay(vst_forest_B_CD)
+gene_vars <- apply(vst_forest_B_CD_matrix, 1, var)
+vst_forest_B_CD_top <- vst_forest_B_CD_matrix[gene_vars > quantile(gene_vars, 0.4), ]
+
+```
+
+
+lasso nested repeated cross-validation for training and validaiton
+
+```{r}
+
+library(caret)
+library(glmnet)
+library(pROC)
+
+set.seed(12345)
+# Create k outer folds
+X <- as.matrix(t(vst_forest_B_CD_top))  # Ensure it's a matrix (genes as columns, samples as rows)
+Y <- factor(CardioProg_B_CD$Group2)  # Ensure it's a factor (0 = non-progressor, 1 = progressor)
+
+```
+
+
+```{r, fig.width=4.5, fig.height=4.0}
+lasso_nested_B_CD <- run_glmnet_nestedcv(X, Y, alpha = 1, outer_folds = 4, inner_folds = 3)
+
+
+
+lasso_features_B_CD_sig<-lasso_nested_B_CD$feature_stability
+lasso_features_B_CD_sig<- subset(lasso_features_B_CD_sig, selection_freq > 0)
+
+
+lasso_features_B_CD_sig = annotate_ML(lasso_features_B_CD_sig,ensembl)
+
+
+
+
+lasso_features_B_CD_sig <- lasso_features_B_CD_sig[
+  order(lasso_features_B_CD_sig$mean_importance, decreasing = TRUE), ]
+
+write.csv(lasso_features_B_CD_sig,file="~/ML/lasso_features_B_CD_sig_all.csv")
+
+ggplot(lasso_features_B_CD_sig[1:30,], aes(x = reorder(external_gene_name, mean_importance), y = mean_importance)) +
+  geom_col(aes(fill = selection_freq)) +
+  #geom_errorbar(aes(ymin = mean_importance - importance_sd, ymax = mean_importance + importance_sd),width = 0.2, color = "black") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue", name = "selection_freq") +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "Mean Importance",
+    title = "Top 30 Lasso"
+  ) +
+  theme_minimal()
+
+
+
+
+# Outer loop performance
+cat("Mean outer AUC:", round(mean(lasso_nested_B_CD$outer_auc), 3),
+    "±", round(sd(lasso_nested_B_CD$outer_auc), 3), "\n")
+
+
+
+
+
+ggsave(filename="~/ML/top30_lasso_B_CD_all.pdf",width = 4.5, height=4) 
+
+# ROC plot (using your existing function)
+plot_rocs(lasso_nested_B_CD)
+
+ggsave(filename="~/ML/roc_lasso_B_CD_all.pdf",width = 4, height=4.2) 
+```
+
+elastic net
+
+```{r, fig.width=4.5, fig.height =4}
+
+
+
+enet_nested_B_CD <- run_glmnet_nestedcv(X, Y, alpha = 0.5, outer_folds = 4, inner_folds = 3)
+
+
+
+enet_features_B_CD_sig<-enet_nested_B_CD$feature_stability
+enet_features_B_CD_sig<- subset(enet_features_B_CD_sig, selection_freq > 0)
+
+enet_features_B_CD_sig= annotate_ML(enet_features_B_CD_sig,ensembl)
+
+
+enet_features_B_CD_sig <- enet_features_B_CD_sig[
+  order(enet_features_B_CD_sig$mean_importance, decreasing = TRUE), ]
+
+write.csv(enet_features_B_CD_sig,file="~/ML/enet_features_B_CD_sig_all.csv")
+
+ggplot(enet_features_B_CD_sig[1:30,], aes(x = reorder(external_gene_name, mean_importance), y = mean_importance)) +
+  geom_col(aes(fill = selection_freq)) +
+  #geom_errorbar(aes(ymin = mean_importance - importance_sd, ymax = mean_importance + importance_sd),width = 0.2, color = "black") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue", name = "selection_freq") +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "Mean Importance",
+    title = "Top30 Elastic Net"
+  ) +
+  theme_minimal()
+
+
+# Outer loop performance
+cat("Mean outer AUC:", round(mean(enet_nested_B_CD$outer_auc), 3),
+    "±", round(sd(enet_nested_B_CD$outer_auc), 3), "\n")
+
+
+
+ggsave(filename="~/Images/ML/top30_enet_B_CD_all.pdf",width = 4.5, height=4) 
+
+# ROC plot (using your existing function)
+plot_rocs(enet_nested_B_CD)
+
+ggsave(filename="~/Images/ML/roc_enet_B_CD_all.pdf",width = 4, height=4.2) 
+```
+
+random. forest
+
+
+```{r}
+
+# Run Random Forest (should now work without errors)
+
+rf_results_B_CD <- run_rf_boruta_nestedcv(t(vst_forest_B_CD_top) , Y, outer_folds = 4, inner_folds =3)
+
+top_rf_features_B_CD_sig = subset(rf_results_B_CD$feature_stability, selection_freq > 0)
+
+top_rf_features_B_CD_sig = annotate_ML(top_rf_features_B_CD_sig,ensembl)
+
+
+top_rf_features_B_CD_sig <- top_rf_features_B_CD_sig[
+  order(top_rf_features_B_CD_sig$mean_importance, decreasing = TRUE), ]
+
+write.csv(top_rf_features_B_CD_sig,file="~/ML/rf_features_B_CD_sig_all.csv")
+```
+
+```{r, fig.width = 4.5, fig.height=4}
+
+
+ggplot(top_rf_features_B_CD_sig[1:30,], aes(x = reorder(external_gene_name, mean_importance), y = mean_importance)) +
+  geom_col(aes(fill =selection_freq)) +
+  #geom_errorbar(aes(ymin = mean_importance - importance_sd, ymax = mean_importance + importance_sd), width = 0.2, color = "black") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue", name = "selection frequency") +
+  coord_flip() +
+  labs(
+    y = "Mean importance",
+    x = NULL,
+    title = "Top30 Random Forest"
+  ) +
+  theme_minimal()
+
+ggsave(filename="~/Images/ML/top30_rf_B_CD_all.pdf",width = 4.5, height=4) 
+
+# ROC plot (using your existing function)
+plot_rocs(rf_results_B_CD)
+
+ggsave(filename="~/Images/ML/roc_rf_B_CD_all.pdf",width = 4, height=4.2) 
+```
+
+
+# Females
+
+focus on Female and exclude A2 and reverters
+```{r}
+Cardioinfo_F=subset(Cardioinfo,Sex=="F"& Group2 %in% c("AA","B1B1","AB1.B2","B1B2.C.D")  & SeqBatch!="NA")
+Cardioinfo_F=droplevels(Cardioinfo_F)
+Cardiocountsonly_F=subset(Cardiocountsonly, select=Cardioinfo_F$Code)
+Cardioinfo_F=as.data.frame(Cardioinfo_F)
+Cardiocountsonly_F=as.data.frame(Cardiocountsonly_F)
+```
+
+
+```{r}
+phenocols_F = list(Group2 = c(AA="#f5b5d6",
+                AB1.B2="#e3599e",
+                B1B1 = "#e174e3", 
+                B1B2.C.D="#8b2eb3"))
+```
+
+
+
+## DGE for Chagas progressors (A -> B1/B2/C) vs non-progressors (A -> A) at time before progression occurs
+
+Subset patients (for both your condition and count file) to only include timepoint 1 to look for biomarkers of progression (rather than changes that have already occured at timepoint2).  
+```{r , echo=FALSE}
+set.seed(12345)
+CardioProg_A_B_F=subset(Cardioinfo_F,Time=="1" & Infected=="Pos" & (Group2=="AA"|Group2=="AB1.B2"))
+CardioProg_A_B_F=droplevels(CardioProg_A_B_F)
+Counts_Prog_A_B_F=subset(Cardiocountsonly_F, select=CardioProg_A_B_F$Code)
+CardioProg_A_B_F$cardiac_freq = as.numeric(CardioProg_A_B_F$cardiac_freq)
+
+
+table(CardioProg_A_B_F$Group2)
+```
+
+
+
+```{r }
+ddsProg_A_B_F=DESeqDataSetFromMatrix(countData = Counts_Prog_A_B_F, 
+        colData =CardioProg_A_B_F, design= ~  Media + SeqBatch + Group2) #  
+keepddsProg_A_B_F= rowSums(counts(ddsProg_A_B_F)>= 10) >=9 #keeps genes with at least 6 samples with 10 counts
+ddsProg_A_B_F <- ddsProg_A_B_F[keepddsProg_A_B_F,]
+```
+
+
+
+```{r , message=FALSE}
+vstProg_A_B_F <- vst(ddsProg_A_B_F, blind = FALSE)
+```
+
+
+
+
+
+### DEGs
+
+Fit the model.
+```{r }
+#, results='hide', message=FALSE
+ddsProg_A_B_F=DESeq(ddsProg_A_B_F) #normalizes, estimates dispersion and fits glm
+```
+
+
+alpha sets FDR (default is 0.1), can also set lfcthreshold  
+```{r }
+resultProg_A_B_F=results(ddsProg_A_B_F,alpha = 0.05,contrast=c("Group2", "AB1.B2", "AA")) 
+summary(resultProg_A_B_F)
+
+```
+
+
+Since contrast was AB vs AA, the Up regulated genes are upregulated in AB compared to AA, and same from down regulated.  
+
+&nbsp;  
+
+
+```{r}
+annotProg_A_B_F <- get_annotated_results(resultProg_A_B_F, ensembl)
+SigAnnotProg_A_B_F <- subset(annotProg_A_B_F, FDR < 0.05 & (log2FC > 0.58 | log2FC< -0.58 ))
+
+write.csv(SigAnnotProg_A_B_F,"~/DEG/SigAnnotProg_A_B_F_F.csv")
+```
+
+
+Volcano plot of data, adjust xlim and ylim to fit all your data points. The positive fold change indicates up regulated genes in AB compared to AA, and the negative fold change are those down regulated in AB compared to AA.  
+```{r, fig.height=6, fig.width=7}
+
+make_volcano(annotProg_A_B_F, labs = c("SPP1","LMOD1"), 
+             FDR_cutoff = 0.05, log2FC_cutoff = 0.58, title = "A->A v A->B", up = "#e3599e", down = "#f5b5d6")
+
+ggsave(filename="~/Images/ABvAA_F_Volcano_select_labeled.pdf",height=6.5, width = 7)
+```
+
+
+
+### GSEA
+&nbsp;
+All genes can be used in GSEA; GSEA aggregates the per gene statistics across genes within a gene set, therefore making it possible to detect situations where all genes in a predefined set change in a small but coordinated way. This is important since it is likely that many relevant phenotypic differences are manifested by small but consistent changes in a set of genes. the goal of GSEA is to determine whether the members of S are randomly distributed throughout the ranked gene list (L) or primarily found at the top or bottom. When the entire gene sets are evaluated, the estimated significance level is adjusted to account for multiple hypothesis testing and also q-values are calculated for FDR control.
+
+
+
+
+```{r}
+gsea_list_Prog_A_B_F= BP_MF_GSEA(annotation = annotProg_A_B_F, comp = "ABvAA") 
+
+
+simple_gsea_list_Prog_A_B_F=simplify_gsea(gsea_list_Prog_A_B_F, sim_cutoff = 0.7)
+simple_gsea_df_Prog_A_B_F = gsea_simple_df(simple_gsea_list_Prog_A_B_F)
+
+```
+
+```{r, fig.width=4.5, fig.height=2.8}
+for (i in seq_along(simple_gsea_df_Prog_A_B_F)) {
+  
+  x <- simple_gsea_df_Prog_A_B_F[[i]]
+  name <- names(simple_gsea_df_Prog_A_B_F)[[i]]
+  
+  if (nrow(x)>10){
+    x <- x[1:10,]
+  }
+   
+p <- ggplot(x, aes(x = GeneRatio, y = Description, size = -log10(p.adjust), color = NES)) +
+    geom_point(na.rm = TRUE, aes(size = -log10(p.adjust), color = NES), shape = 21, fill = NA, stroke = 0.6, alpha = 0.9) +  
+    geom_point(na.rm = TRUE, aes(size = -log10(p.adjust), fill = NES), shape = 21, color = "black", stroke = 0.6)+  # Avoid plotting NA values
+    scale_size_continuous(range = c(0.25, 6)) +  # Avoid size for missing data
+    scale_color_gradient2(low = "#f5b5d6", mid = "lightgrey",high = "#e3599e",midpoint = 0) + 
+  scale_fill_gradient2(low = "#f5b5d6", mid = "lightgrey",high = "#e3599e",midpoint = 0) + 
+    theme_minimal() +
+  #scale_alpha_continuous(range = c(0.3, 1)) + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          axis.text.y = element_text(size = 9),
+          legend.key.size = unit(0.4, 'cm'), #change legend key size
+          legend.title = element_text(size=9.5), #change legend title font size
+          legend.text = element_text(size=7))+
+  scale_y_discrete(labels = label_wrap(50), limits = rev) + ggtitle(name)+
+  ylab(NULL)
+
+print(p)
+
+  ggsave(p,filename=paste0("~/Images/GO/top10_gsea",name,"_F.pdf"),width = 4.5, height=2.8) 
+}
+```
+
+### Cross-validation
+first remove batch effects using combat-seq
+
+In ComBat-seq, user may specify biological covariates, whose signals will be preserved in the adjusted data. If the user would like to specify one biological variable, they may use the group parameter:
+ 
+```{r}
+
+adj_Counts_Prog_A_B_F <- ComBat_seq(as.matrix(Counts_Prog_A_B_F), batch=CardioProg_A_B_F$SeqBatch, group=CardioProg_A_B_F$Group2)
+
+
+dds_forest_A_B_F <- DESeqDataSetFromMatrix(
+  countData = adj_Counts_Prog_A_B_F,  # Batch-corrected counts
+  colData = CardioProg_A_B_F,
+  design = ~ 1            # Primary variable of interest (progressors vs. non-progressors)
+)
+
+keepdds_forest_A_B_F= rowSums(counts(dds_forest_A_B_F)>= 10) >=9
+dds_forest_A_B_F <- dds_forest_A_B_F[keepdds_forest_A_B_F,]
+dds_forest_A_B_F <- DESeq(dds_forest_A_B_F)
+vst_forest_A_B_F <- vst(dds_forest_A_B_F, blind = FALSE)
+
+
+vst_forest_A_B_F_sig <- vst_forest_A_B_F[SigAnnotProg_A_B_F$ensembl_gene_id,]
+vst_forest_A_B_F_sig<-assay(vst_forest_A_B_F_sig)
+vst_forest_A_B_F_matrix<-assay(vst_forest_A_B_F)
+gene_vars_A_B_F <- apply(vst_forest_A_B_F_matrix, 1, var)
+vst_forest_A_B_F_top <- vst_forest_A_B_F_matrix[gene_vars_A_B_F > quantile(gene_vars_A_B_F, 0.4), ]
+```
+
+
+lasso nested repeated cross-validation for training and validaiton
+
+```{r}
+
+
+
+set.seed(12345)
+# Create k outer folds
+X <- as.matrix(t(vst_forest_A_B_F_top))  # Ensure it's a matrix (genes as columns, samples as rows)
+Y <- factor(CardioProg_A_B_F$Group2)  # Ensure it's a factor (0 = non-progressor, 1 = progressor)
+
+```
+
+
+```{r, fig.width=4.5, fig.height=4.0}
+
+lasso_nested_A_B_F <- run_glmnet_nestedcv(X, Y, alpha = 1, outer_folds = 4, inner_folds = 3)
+
+
+
+lasso_features_A_B_F_sig<-lasso_nested_A_B_F$feature_stability
+lasso_features_A_B_F_sig<- subset(lasso_features_A_B_F_sig, selection_freq > 0)
+
+
+lasso_features_A_B_F_sig = annotate_ML(lasso_features_A_B_F_sig,ensembl)
+
+
+lasso_features_A_B_F_sig <- lasso_features_A_B_F_sig[
+  order(lasso_features_A_B_F_sig$mean_importance, decreasing = TRUE), ]
+
+write.csv(lasso_features_A_B_F_sig,file="~/ML/lasso_features_A_B_F_sig_F.csv")
+
+ggplot(lasso_features_A_B_F_sig[1:30,], aes(x = reorder(external_gene_name, mean_importance), y = mean_importance)) +
+  geom_col(aes(fill = selection_freq)) +
+  #geom_errorbar(aes(ymin = mean_importance - importance_sd, ymax = mean_importance + importance_sd),width = 0.2, color = "black") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue", name = "selection_freq") +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "Mean Importance",
+    title = "Top 30 Lasso"
+  ) +
+  theme_minimal()
+
+
+
+
+# Outer loop performance
+cat("Mean outer AUC:", round(mean(lasso_nested_A_B_F$outer_auc), 3),
+    "±", round(sd(lasso_nested_A_B_F$outer_auc), 3), "\n")
+
+
+
+
+
+ggsave(filename="~/Images/ML/top30_lasso_AvB_F.pdf",width = 4.5, height=4) 
+
+# ROC plot (using your existing function)
+plot_rocs(lasso_nested_A_B_F)
+
+ggsave(filename="~/Images/ML/roc_lasso_AvB_F.pdf",width = 4, height=4.2) 
+```
+
+elastic net
+
+```{r, fig.width=4.5, fig.height =4}
+
+
+
+enet_nested_A_B_F <- run_glmnet_nestedcv(X, Y, alpha = 0.5, outer_folds = 4, inner_folds = 3)
+
+
+
+enet_features_A_B_F_sig<-enet_nested_A_B_F$feature_stability
+enet_features_A_B_F_sig<- subset(enet_features_A_B_F_sig, selection_freq > 0)
+
+enet_features_A_B_F_sig = annotate_ML(enet_features_A_B_F_sig,ensembl)
+
+
+enet_features_A_B_F_sig <- enet_features_A_B_F_sig[
+  order(enet_features_A_B_F_sig$mean_importance, decreasing = TRUE), ]
+
+write.csv(enet_features_A_B_F_sig,file="~/ML/enet_features_A_B_F_sig_F.csv")
+
+ggplot(enet_features_A_B_F_sig[1:30,], aes(x = reorder(external_gene_name, mean_importance), y = mean_importance)) +
+  geom_col(aes(fill = selection_freq)) +
+  #geom_errorbar(aes(ymin = mean_importance - importance_sd, ymax = mean_importance + importance_sd),width = 0.2, color = "black") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue", name = "selection_freq") +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "Mean Importance",
+    title = "Top30 Elastic Net"
+  ) +
+  theme_minimal()
+
+
+# Outer loop performance
+cat("Mean outer AUC:", round(mean(enet_nested_A_B_F$outer_auc), 3),
+    "±", round(sd(enet_nested_A_B_F$outer_auc), 3), "\n")
+
+
+
+ggsave(filename="~/Images/ML/top30_enet_AvB_F.pdf",width = 4.5, height=4) 
+
+# ROC plot (using your existing function)
+plot_rocs(enet_nested_A_B_F)
+
+ggsave(filename="~/Images/ML/roc_enet_AvB_F.pdf",width = 4, height=4.2) 
+```
+
+Random forest
+
+```{r}
+
+# Run Random Forest (should now work without errors)
+
+rf_results_A_B_F <- run_rf_boruta_nestedcv(t(vst_forest_A_B_F_top) , Y, outer_folds = 4, inner_folds =3)
+
+top_rf_features_A_B_F_sig = subset(rf_results_A_B_F$feature_stability, selection_freq > 0)
+
+top_rf_features_A_B_F_sig = annotate_ML(top_rf_features_A_B_F_sig,ensembl)
+
+
+top_rf_features_A_B_F_sig <- top_rf_features_A_B_F_sig[
+  order(top_rf_features_A_B_F_sig$mean_importance, decreasing = TRUE), ]
+
+write.csv(top_rf_features_A_B_F_sig,file="~/ML/rf_features_A_B_F_sig_F.csv")
+```
+
+```{r, fig.width = 4.5, fig.height=4}
+
+
+ggplot(top_rf_features_A_B_F_sig[1:30,], aes(x = reorder(external_gene_name, mean_importance), y = mean_importance)) +
+  geom_col(aes(fill =selection_freq)) +
+  #geom_errorbar(aes(ymin = mean_importance - importance_sd, ymax = mean_importance + importance_sd), width = 0.2, color = "black") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue", name = "selection frequency") +
+  coord_flip() +
+  labs(
+    y = "Mean importance",
+    x = NULL,
+    title = "Top30 Random Forest"
+  ) +
+  theme_minimal()
+
+ggsave(filename="~/Images/ML/top30_rf_A_B_F_F.pdf",width = 4.5, height=4) 
+
+# ROC plot (using your existing function)
+plot_rocs(rf_results_A_B_F)
+
+ggsave(filename="~/Images/ML/roc_rf_A_B_F_F.pdf",width = 4, height=4.2) 
+```
+
+
+```{r, fig.height = 3.5, fig.width =5.5}
+selected_genes <- c(enet_features_A_B_F_sig$external_gene_name[1:15])
+selected_gene_ids <- c(enet_features_A_B_F_sig$feature[1:15])
+
+corrected_vstProg_A_B_F <- assay(vst_forest_A_B_F)
+
+mm_Prog_A_B_F <- model.matrix(~Group2, colData(vstProg_A_B_F))
+
+corrected_vstProg_A_B_F <- limma::removeBatchEffect(
+  corrected_vstProg_A_B_F,
+  #batch = vstProg_A_B_F$SeqBatch,       # Primary batch effect already removed with combatseq
+  batch2 = vstProg_A_B_F$Media,             # Secondary batch effect
+  design = mm_Prog_A_B_F            # Protect biological variables
+)
+
+mat_Prog_A_B_F= corrected_vstProg_A_B_F[selected_gene_ids,] - rowMeans(corrected_vstProg_A_B_F[selected_gene_ids,])
+
+pdf("~/Images/ML/heatmap_A_B_F_F.pdf",width = 5.5, height=3.5)
+vstProg_A_B_F_limma <- vst_forest_A_B_F
+assay(vstProg_A_B_F_limma) <- corrected_vstProg_A_B_F
+
+
+sampleinfo= data.frame(colData(vstProg_A_B_F_limma)[,c("Group2","SeqBatch")])
+sampleinfo=subset(sampleinfo, select= -SeqBatch)
+
+pheatmap(mat_Prog_A_B_F, annotation_col = sampleinfo, show_colnames = FALSE, labels_row = selected_genes, fontsize=10,color = colorRampPalette(rev(brewer.pal(n = 7, name ="RdBu")))(100),
+         annotation_colors = phenocols_F,
+         breaks = c(seq(min(mat_Prog_A_B_F), 0, length.out = 50),
+            seq(0.0000001, max(mat_Prog_A_B_F), length.out = 50)))
+
+dev.off()
+
+pheatmap(mat_Prog_A_B_F, annotation_col = sampleinfo, show_colnames = FALSE, labels_row = selected_genes, fontsize=10,color = colorRampPalette(rev(brewer.pal(n = 7, name ="RdBu")))(100),
+         annotation_colors = phenocols_F,
+         breaks = c(seq(min(mat_Prog_A_B_F), 0, length.out = 50),
+            seq(0.0000001, max(mat_Prog_A_B_F), length.out = 50)))
+```
+
+
+
+
+## DGE of B1 --> B2/C/D vs B1 --> B1
+
+
+Subset to only include timepoint 1 and positive to look for biomarkers of progression (rather than changes that have already occured at timepoint2).  
+```{r , echo=FALSE}
+CardioProg_B_CD_F=subset(Cardioinfo_F,Time=="1" & Infected=="Pos" & Group2 %in% c("B1B1","B1B2.C.D") )
+
+
+CardioProg_B_CD_F=droplevels(CardioProg_B_CD_F)
+Counts_Prog_B_CD_F=subset(Cardiocountsonly_F, select=CardioProg_B_CD_F$Code)
+
+table(CardioProg_B_CD_F$Group2)
+```
+
+
+```{r designProgressors}
+ddsProg_B_CD_F=DESeqDataSetFromMatrix(countData = Counts_Prog_B_CD_F, 
+        colData =CardioProg_B_CD_F, design= ~ SeqBatch + Media + Group2)
+keepddsProg_B_CD_F= rowSums(counts(ddsProg_B_CD_F)>= 10) >=9 #keeps genes with at least 3 samples with 10 counts
+ddsProg_B_CD_F <- ddsProg_B_CD_F[keepddsProg_B_CD_F,]
+```
+
+### PCA
+```{r vstProg_A_B_Fressors, message=FALSE}
+vstProg_B_CD_F <- vst(ddsProg_B_CD_F, blind = FALSE)
+
+```
+
+
+
+### DEG
+Fit the model. Here some rows dont converge as shown in $betaConv, so we remove them.  
+
+```{r modelProgressors}
+ddsProg_B_CD_F=DESeq(ddsProg_B_CD_F)
+```
+
+alpha sets FDR (default is 0.1), can also set lfcthreshold  
+```{r resultProg_B_CD_Fressors}
+
+resultProg_B_CD_F=results(ddsProg_B_CD_F,alpha = 0.05,contrast=c("Group2", "B1B2.C.D", "B1B1")) 
+summary(resultProg_B_CD_F)
+
+```
+
+Since contrast was  BC vs BB, the Up regulated genes are upregulated in BC compared to BB, and same from down regulated.  
+
+&nbsp;  
+
+Annotate the ensemble ID with their gene name using biomart (I find this is more complete than org.Hs.eg.db, but it requires internet connection and is a bit slower).  
+
+```{r annotateProg_B_CD_Fressors}
+
+annotProg_B_CD_F <- get_annotated_results(resultProg_B_CD_F, ensembl)
+
+SigAnnotProg_B_CD_F = subset(annotProg_B_CD_F, FDR < 0.05 & (log2FC > 0.58 | log2FC< -0.58 ))
+write.csv(SigAnnotProg_B_CD_F,"~/DEG/SigAnnotProg_B_CD_F_F.csv")
+
+```
+
+Volcano plot of data, adjust xlim and ylim to fit all your data points. I set my cut offs to pCutoff = 0.1 (FDR < 0.1) and FCcutoff=0.5 (FC of 1.41). The positive fold change indicates up regulated genes in BC compared to BB, and the negative fold change are those down regulated in BC compared to BB.  
+```{r volcanoProg_B_CD_Fressors, echo=FALSE, fig.height=6.5, fig.width=7}
+
+
+make_volcano(annotProg_B_CD_F, labs =c("IGHA1","IGHG1","IGHV2-5","IGHV3-33","IGHV4-39","IGHV4-59","IGKC","IGKV1-12","IGKV1-39","IGKV1-5","IGKV4-1","IGLC2","IGLV1-40","TSN1","IGLV1-44","IGLV3-21","GCSAML","EOMES","PAX5","TCL1A","FCRL1","CD160","CRTAM","LTBP2"), 
+             #"ACKR1","ACKR2","MRC2","TGM2",,"ZBED2","TCL6","CTSE","CTSB",
+             
+             FDR_cutoff = 0.05, log2FC_cutoff = 0.58, title = "B->C/D vs B->B",up = "#8b2eb3", down = "#c944bc")
+
+
+ggsave(filename="~/Images/BCvBB_F_Volcano_labeled.pdf",height=6.5,width=7)
+```
+
+
+
+### GSEA
+&nbsp;
+All genes can be used in GSEA; GSEA aggregates the per gene statistics across genes within a gene set, therefore making it possible to detect situations where all genes in a predefined set change in a small but coordinated way. This is important since it is likely that many relevant phenotypic differences are manifested by small but consistent changes in a set of genes. the goal of GSEA is to determine whether the members of S are randomly distributed throughout the ranked gene list (L) or primarily found at the top or bottom. When the entire gene sets are evaluated, the estimated significance level is adjusted to account for multiple hypothesis testing and also q-values are calculated for FDR control.
+
+
+
+```{r}
+gsea_list_Prog_B_CD_F= BP_MF_GSEA(annotation = annotProg_B_CD_F,comp="BCvBB") 
+
+    
+
+
+simple_gsea_list_Prog_B_CD_F= simplify_gsea(gsea_list_Prog_B_CD_F, sim_cutoff = 0.70)
+simple_gsea_df_Prog_B_CD_F = gsea_simple_df(simple_gsea_list_Prog_B_CD_F)
+
+
+```
+
+```{r, fig.width=4.6, fig.height=2.8}
+for (i in seq_along(simple_gsea_df_Prog_B_CD_F)) {
+  
+  x <- simple_gsea_df_Prog_B_CD_F[[i]]
+  name <- names(simple_gsea_df_Prog_B_CD_F)[[i]]
+  
+  if (nrow(x)>10){
+    x <- x[1:10,]
+  }
+   
+p <- ggplot(x, aes(x = GeneRatio, y = Description, size = -log10(p.adjust), color = NES)) +
+    geom_point(na.rm = TRUE, aes(size = -log10(p.adjust), color = NES), shape = 21, fill = NA, stroke = 0.6, alpha = 0.9) +  
+    geom_point(na.rm = TRUE, aes(size = -log10(p.adjust), fill = NES), shape = 21, color = "black", stroke = 0.6)+  # Avoid plotting NA values
+    scale_size_continuous(range = c(0.25, 6)) +  # Avoid size for missing data
+    scale_color_gradient2(low = "#e174e3", mid = "lightgrey",high = "#8b2eb3",midpoint = 0) + 
+  scale_fill_gradient2(low = "#e174e3", mid = "lightgrey",high = "#8b2eb3",midpoint = 0) + 
+    theme_minimal() +
+  #scale_alpha_continuous(range = c(0.3, 1)) + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          axis.text.y = element_text(size = 9),
+          legend.key.size = unit(0.4, 'cm'), #change legend key size
+          legend.title = element_text(size=9.5), #change legend title font size
+          legend.text = element_text(size=7))+
+  scale_y_discrete(labels = label_wrap(50), limits = rev) + ggtitle(name)+
+  ylab(NULL)
+
+print(p)
+
+  ggsave(p,filename=paste0("~/Images/GO/top10_gsea",name,"_F.pdf"),width = 4.6, height=2.8) 
+}
+```
+
+
+### Cross-validation
+
+first remove bathc effects using combat-seq
+
+In ComBat-seq, user may specify biological covariates, whose signals will be preserved in the adjusted data. If the user would like to specify one biological variable, they may use the group parameter:
+ 
+```{r}
+
+adj_Counts_Prog_B_CD_F <- ComBat_seq(as.matrix(Counts_Prog_B_CD_F), batch=CardioProg_B_CD_F$SeqBatch, group=CardioProg_B_CD_F$Group2)
+
+
+
+dds_forest_B_CD_F <- DESeqDataSetFromMatrix(
+  countData = adj_Counts_Prog_B_CD_F,  # Batch-corrected counts
+  colData = CardioProg_B_CD_F,
+  design = ~ 1             # Primary variable of interest (progressors vs. non-progressors)
+)
+
+keepdds_forest_B_CD_F= rowSums(counts(dds_forest_B_CD_F)>= 10) >=9
+dds_forest_B_CD_F <- dds_forest_B_CD_F[keepdds_forest_B_CD_F,]
+dds_forest_B_CD_F <- DESeq(dds_forest_B_CD_F)
+
+vst_forest_B_CD_F <- vst(dds_forest_B_CD_F, blind = FALSE)
+vst_forest_B_CD_F_matrix<-assay(vst_forest_B_CD_F)
+gene_vars <- apply(vst_forest_B_CD_F_matrix, 1, var)
+vst_forest_B_CD_F_top <- vst_forest_B_CD_F_matrix[gene_vars > quantile(gene_vars, 0.4), ]
+
+```
+
+
+lasso nested repeated cross-validation for training and validaiton
+
+```{r}
+
+
+set.seed(12345)
+# Create k outer folds
+X <- as.matrix(t(vst_forest_B_CD_F_top))  # Ensure it's a matrix (genes as columns, samples as rows)
+Y <- factor(CardioProg_B_CD_F$Group2)  # Ensure it's a factor (0 = non-progressor, 1 = progressor)
+
+```
+
+
+```{r, fig.width=4.5, fig.height=4.0}
+lasso_nested_B_CD_F <- run_glmnet_nestedcv(X, Y, alpha = 1, outer_folds = 4, inner_folds = 3)
+
+
+
+lasso_features_B_CD_F_sig<-lasso_nested_B_CD_F$feature_stability
+lasso_features_B_CD_F_sig<- subset(lasso_features_B_CD_F_sig, selection_freq > 0)
+
+lasso_features_B_CD_F_sig = annotate_ML(lasso_features_B_CD_F_sig,ensembl)
+
+
+
+lasso_features_B_CD_F_sig <- lasso_features_B_CD_F_sig[
+  order(lasso_features_B_CD_F_sig$mean_importance, decreasing = TRUE), ]
+
+write.csv(lasso_features_B_CD_F_sig,file="~/ML/lasso_features_B_CD_F_sig_F.csv")
+
+ggplot(lasso_features_B_CD_F_sig[1:30,], aes(x = reorder(external_gene_name, mean_importance), y = mean_importance)) +
+  geom_col(aes(fill = selection_freq)) +
+  #geom_errorbar(aes(ymin = mean_importance - importance_sd, ymax = mean_importance + importance_sd),width = 0.2, color = "black") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue", name = "selection_freq") +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "Mean Importance",
+    title = "Top 30 Lasso"
+  ) +
+  theme_minimal()
+
+
+
+
+# Outer loop performance
+cat("Mean outer AUC:", round(mean(lasso_nested_B_CD_F$outer_auc), 3),
+    "±", round(sd(lasso_nested_B_CD_F$outer_auc), 3), "\n")
+
+
+
+
+
+ggsave(filename="~/Images/ML/top30_lasso_B_CD_F_F.pdf",width = 4.5, height=4) 
+
+# ROC plot (using your existing function)
+plot_rocs(lasso_nested_B_CD_F)
+
+ggsave(filename="~/Images/ML/roc_lasso_B_CD_F_F.pdf",width = 4, height=4.2) 
+```
+
+elastic net
+
+```{r, fig.width=4.5, fig.height =4}
+
+
+
+enet_nested_B_CD_F <- run_glmnet_nestedcv(X, Y, alpha = 0.5, outer_folds = 4, inner_folds = 3)
+
+
+
+enet_features_B_CD_F_sig<-enet_nested_B_CD_F$feature_stability
+enet_features_B_CD_F_sig<- subset(enet_features_B_CD_F_sig, selection_freq > 0)
+
+enet_features_B_CD_F_sig = annotate_ML(enet_features_B_CD_F_sig,ensembl)
+
+
+enet_features_B_CD_F_sig <- enet_features_B_CD_F_sig[
+  order(enet_features_B_CD_F_sig$mean_importance, decreasing = TRUE), ]
+
+write.csv(enet_features_B_CD_F_sig,file="~/ML/enet_features_B_CD_F_sig_F.csv")
+
+ggplot(enet_features_B_CD_F_sig[1:30,], aes(x = reorder(external_gene_name, mean_importance), y = mean_importance)) +
+  geom_col(aes(fill = selection_freq)) +
+  #geom_errorbar(aes(ymin = mean_importance - importance_sd, ymax = mean_importance + importance_sd),width = 0.2, color = "black") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue", name = "selection_freq") +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "Mean Importance",
+    title = "Top30 Elastic Net"
+  ) +
+  theme_minimal()
+
+
+# Outer loop performance
+cat("Mean outer AUC:", round(mean(enet_nested_B_CD_F$outer_auc), 3),
+    "±", round(sd(enet_nested_B_CD_F$outer_auc), 3), "\n")
+
+
+
+ggsave(filename="~/Images/ML/top30_enet_B_CD_F_F.pdf",width = 4.5, height=4) 
+
+# ROC plot (using your existing function)
+plot_rocs(enet_nested_B_CD_F)
+
+ggsave(filename="~/Images/ML/roc_enet_B_CD_F_F.pdf",width = 4, height=4.2) 
+```
+
+random. forest
+
+
+```{r}
+
+# Run Random Forest (should now work without errors)
+
+rf_results_B_CD_F <- run_rf_boruta_nestedcv(t(vst_forest_B_CD_F_top) , Y, outer_folds = 4, inner_folds =3)
+
+top_rf_features_B_CD_F_sig = subset(rf_results_B_CD_F$feature_stability, selection_freq > 0)
+
+top_rf_features_B_CD_F_sig = annotate_ML(top_rf_features_B_CD_F_sig,ensembl)
+
+
+top_rf_features_B_CD_F_sig <- top_rf_features_B_CD_F_sig[
+  order(top_rf_features_B_CD_F_sig$mean_importance, decreasing = TRUE), ]
+
+write.csv(top_rf_features_B_CD_F_sig,file="~/ML/rf_features_B_CD_F_sig_F.csv")
+```
+
+```{r, fig.width = 4.5, fig.height=4}
+
+
+ggplot(top_rf_features_B_CD_F_sig[1:30,], aes(x = reorder(external_gene_name, mean_importance), y = mean_importance)) +
+  geom_col(aes(fill =selection_freq)) +
+  #geom_errorbar(aes(ymin = mean_importance - importance_sd, ymax = mean_importance + importance_sd), width = 0.2, color = "black") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue", name = "selection frequency") +
+  coord_flip() +
+  labs(
+    y = "Mean importance",
+    x = NULL,
+    title = "Top30 Random Forest"
+  ) +
+  theme_minimal()
+
+ggsave(filename="~/Images/ML/top30_rf_B_CD_F_F.pdf",width = 4.5, height=4) 
+
+# ROC plot (using your existing function)
+plot_rocs(rf_results_B_CD_F)
+
+ggsave(filename="~/ML/roc_rf_B_CD_F_F.pdf",width = 4, height=4.2) 
+```
+
+
+
+
+```{r, fig.height = 3.5, fig.width =5.5}
+selected_genes <- c(enet_features_B_CD_F_sig$external_gene_name[1:15])
+selected_gene_ids <- c(enet_features_B_CD_F_sig$feature[1:15])
+
+
+corrected_vstProg_B_CD_F <- assay(vst_forest_B_CD_F)
+
+mm_Prog_B_CD_F <- model.matrix(~Group2, colData(vstProg_B_CD_F))
+
+corrected_vstProg_B_CD_F <- limma::removeBatchEffect(
+  corrected_vstProg_B_CD_F,
+ # batch = vstProg_B_CD_F$SeqBatch,       # Primary batch effect already removed with combatseq
+  batch2 = vstProg_B_CD_F$Media,             # Secondary batch effect, remove for visualization only
+  design = mm_Prog_B_CD_F            # Protect biological variables
+)
+
+
+mat_Prog_B_CD_F= corrected_vstProg_B_CD_F[selected_gene_ids,] - rowMeans(corrected_vstProg_B_CD_F[selected_gene_ids,])
+
+pdf("~/Images/ML/heatmap_B_CD_F_F.pdf",width = 5.5, height=3.5)
+
+vstProg_B_CD_F_limma <- vst_forest_B_CD_F
+assay(vstProg_B_CD_F_limma) <- corrected_vstProg_B_CD_F
+
+sampleinfo= data.frame(colData(vstProg_B_CD_F_limma )[,c("Group2","SeqBatch")])
+sampleinfo=subset(sampleinfo, select= -SeqBatch)
+
+pheatmap(mat_Prog_B_CD_F, annotation_col = sampleinfo, show_colnames = FALSE, labels_row = selected_genes, fontsize=10,color = colorRampPalette(rev(brewer.pal(n = 7, name ="RdBu")))(100),
+         annotation_colors = phenocols_F,
+         breaks = c(seq(min(mat_Prog_B_CD_F), 0, length.out = 50),
+            seq(0.0000001, max(mat_Prog_B_CD_F), length.out = 50)))
+
+dev.off()
+
+pheatmap(mat_Prog_B_CD_F, annotation_col = sampleinfo, show_colnames = FALSE, labels_row = selected_genes, fontsize=10,color = colorRampPalette(rev(brewer.pal(n = 7, name ="RdBu")))(100),
+         annotation_colors = phenocols_F,
+         breaks = c(seq(min(mat_Prog_B_CD_F), 0, length.out = 50),
+            seq(0.0000001, max(mat_Prog_B_CD_F), length.out = 50)))
+```
+
+
+# Males
+
+focus on male and exclude A2 and reverters
+```{r}
+Cardioinfo_M=subset(Cardioinfo,Sex=="M"& Group2 %in% c("AA","B1B1","AB1.B2","B1B2.C.D") & SeqBatch!="NA")
+Cardioinfo_M=droplevels(Cardioinfo_M)
+Cardiocountsonly_M=subset(Cardiocountsonly, select=Cardioinfo_M$Code)
+Cardioinfo_M=as.data.frame(Cardioinfo_M)
+Cardiocountsonly_M=as.data.frame(Cardiocountsonly_M)
+```
+
+
+
+```{r}
+phenocols_M = list(Group2 = c(AA="#f8fa89",
+                AB1.B2="#f0c405",
+                B1B1 = "#ffa45e",
+                B1B2.C.D="#ed5b37"))
+```
+
+
+
+
+## DGE for Chagas progressors (A -> B1/B2) vs non-progressors (A -> A) at time before progression occurs
+
+Subset patients (for both your condition and count file) to only include timepoint 1 to look for biomarkers of progression (rather than changes that have already occured at timepoint2).  
+```{r , echo=FALSE}
+CardioProg_A_B_M=subset(Cardioinfo_M,Time=="1" & Infected=="Pos" & (Group2=="AA"|Group2=="AB1.B2"))
+CardioProg_A_B_M=droplevels(CardioProg_A_B_M)
+Counts_Prog_A_B_M=subset(Cardiocountsonly_M, select=CardioProg_A_B_M$Code)
+CardioProg_A_B_M$cardiac_freq = as.numeric(CardioProg_A_B_M$cardiac_freq)
+
+
+table(CardioProg_A_B_M$Group2)
+```
+
+
+```{r }
+ddsProg_A_B_M=DESeqDataSetFromMatrix(countData = Counts_Prog_A_B_M, 
+        colData =CardioProg_A_B_M, design= ~  Media + SeqBatch + Group2)
+keepddsProg_A_B_M= rowSums(counts(ddsProg_A_B_M)>= 10) >=9 #keeps genes with at least 10 samples with 10 counts (edit to 10 when get additional samples)
+ddsProg_A_B_M <- ddsProg_A_B_M[keepddsProg_A_B_M,]
+```
+
+
+```{r , message=FALSE}
+vstProg_A_B_M <- vst(ddsProg_A_B_M, blind = FALSE)
+```
+
+
+
+### DEG
+Fit the model.
+```{r}
+#, results='hide', message=FALSE
+ddsProg_A_B_M=DESeq(ddsProg_A_B_M) #normalizes, estimates dispersion and fits glm
+```
+
+
+alpha sets FDR (default is 0.1), can also set lfcthreshold  
+```{r }
+resultProg_A_B_M=results(ddsProg_A_B_M,alpha = 0.05,contrast=c("Group2", "AB1.B2", "AA")) 
+summary(resultProg_A_B_M)
+```
+
+Since contrast was AB vs AA, the Up regulated genes are upregulated in AB compared to AA, and same from down regulated.  
+
+&nbsp;  
+
+Annotate the ensemble ID with their gene name using biomart (I find this is more complete than org.Hs.eg.db, but it requires internet connection and is a bit slower).  
+
+
+```{r}
+
+annotProg_A_B_M <- get_annotated_results(resultProg_A_B_M, ensembl)
+SigAnnotProg_A_B_M <- subset(annotProg_A_B_M, FDR < 0.05& (log2FC > 0.58 | log2FC< -0.58 ))
+
+write.csv(SigAnnotProg_A_B_M,"~/DEG/SigAnnotProg_A_B_M_M.csv")
+```
+
+Volcano plot of data, adjust xlim and ylim to fit all your data points.  The positive fold change indicates up regulated genes in AB compared to AA, and the negative fold change are those down regulated in AB compared to AA.  
+```{r, fig.height=6, fig.width=7}
+
+make_volcano(annotProg_A_B_M, labs = c("APOL4","EGOT","ZEB2-AS1","CD44-AS1","HHAT","IGLV2-8","IGLV3-19","IGLV3-10","IGHV3-49"),
+FDR_cutoff = 0.05, log2FC_cutoff = 0.58, title = "A->A v A->B", up = "#f0c405", down = "#f8fa89" )
+
+ggsave(filename="~/Images/ABvAA_M_Volcano_labeled.pdf",height=6.5, width = 7)
+```
+
+
+
+### GSEA
+
+&nbsp;
+All genes can be used in GSEA; GSEA aggregates the per gene statistics across genes within a gene set, therefore making it possible to detect situations where all genes in a predefined set change in a small but coordinated way. This is important since it is likely that many relevant phenotypic differences are manifested by small but consistent changes in a set of genes. the goal of GSEA is to determine whether the members of S are randomly distributed throughout the ranked gene list (L) or primarily found at the top or bottom. When the entire gene sets are evaluated, the estimated significance level is adjusted to account for multiple hypothesis testing and also q-values are calculated for FDR control.
+
+
+
+
+```{r}
+gsea_list_Prog_A_B_M= BP_MF_GSEA(annotation = annotProg_A_B_M, comp = "ABvAA") 
+
+
+
+
+
+simple_gsea_list_Prog_A_B_M=simplify_gsea(gsea_list_Prog_A_B_M, sim_cutoff = 0.7)
+simple_gsea_df_Prog_A_B_M = gsea_simple_df(simple_gsea_list_Prog_A_B_M)
+
+```
+
+```{r, fig.width=4.5, fig.height=2.8}
+for (i in seq_along(simple_gsea_df_Prog_A_B_M)) {
+  
+  x <- simple_gsea_df_Prog_A_B_M[[i]]
+  name <- names(simple_gsea_df_Prog_A_B_M)[[i]]
+  
+  if (nrow(x)>10){
+    x <- x[1:10,]
+  }
+   
+p <- ggplot(x, aes(x = GeneRatio, y = Description, size = -log10(p.adjust), color = NES)) +
+    geom_point(na.rm = TRUE, aes(size = -log10(p.adjust), color = NES), shape = 21, fill = NA, stroke = 0.6, alpha = 0.9) +  
+    geom_point(na.rm = TRUE, aes(size = -log10(p.adjust), fill = NES), shape = 21, color = "black", stroke = 0.6)+  # Avoid plotting NA values
+    scale_size_continuous(range = c(0.25, 6)) +  # Avoid size for missing data
+    scale_color_gradient2(low = "#f8fa89", mid = "lightgrey",high = "#f0c405",midpoint = 0) + 
+  scale_fill_gradient2(low = "#f8fa89", mid = "lightgrey",high = "#f0c405",midpoint = 0) + 
+    theme_minimal() +
+  #scale_alpha_continuous(range = c(0.3, 1)) + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          axis.text.y = element_text(size = 9),
+          legend.key.size = unit(0.4, 'cm'), #change legend key size
+          legend.title = element_text(size=9.5), #change legend title font size
+          legend.text = element_text(size=7))+
+  scale_y_discrete(labels = label_wrap(50), limits = rev) + ggtitle(name)+
+  ylab(NULL)
+
+print(p)
+
+  ggsave(p,filename=paste0("~/Images/GO/top10_gsea",name,"_M.pdf"),width = 4.5, height=2.8) 
+}
+```
+
+### Cross-validation
+first remove batch effects using combat-seq
+
+In ComBat-seq, user may specify biological covariates, whose signals will be preserved in the adjusted data. If the user would like to specify one biological variable, they may use the group parameter:
+ 
+```{r}
+
+adj_Counts_Prog_A_B_M <- ComBat_seq(as.matrix(Counts_Prog_A_B_M), batch=CardioProg_A_B_M$SeqBatch, group=CardioProg_A_B_M$Group2)
+
+
+dds_forest_A_B_M <- DESeqDataSetFromMatrix(
+  countData = adj_Counts_Prog_A_B_M,  # Batch-corrected counts
+  colData = CardioProg_A_B_M,
+  design = ~ 1            # Primary variable of interest (progressors vs. non-progressors)
+)
+
+keepdds_forest_A_B_M= rowSums(counts(dds_forest_A_B_M)>= 10) >=9
+dds_forest_A_B_M <- dds_forest_A_B_M[keepdds_forest_A_B_M,]
+dds_forest_A_B_M <- DESeq(dds_forest_A_B_M)
+vst_forest_A_B_M <- vst(dds_forest_A_B_M, blind = FALSE)
+
+
+vst_forest_A_B_M_matrix<-assay(vst_forest_A_B_M)
+gene_vars_A_B_M <- apply(vst_forest_A_B_M_matrix, 1, var)
+vst_forest_A_B_M_top <- vst_forest_A_B_M_matrix[gene_vars_A_B_M > quantile(gene_vars_A_B_M, 0.4), ]
+```
+
+
+lasso nested repeated cross-validation for training and validaiton
+
+```{r}
+
+library(caret)
+library(glmnet)
+library(pROC)
+
+set.seed(12345)
+# Create k outer folds
+X <- as.matrix(t(vst_forest_A_B_M_top))  # Ensure it's a matrix (genes as columns, samples as rows)
+Y <- factor(CardioProg_A_B_M$Group2)  # Ensure it's a factor (0 = non-progressor, 1 = progressor)
+
+```
+
+
+```{r, fig.width=4.5, fig.height=4.0}
+
+lasso_nested_A_B_M <- run_glmnet_nestedcv(X, Y, alpha = 1, outer_folds = 4, inner_folds = 3)
+
+
+
+lasso_features_A_B_M_sig<-lasso_nested_A_B_M$feature_stability
+lasso_features_A_B_M_sig<- subset(lasso_features_A_B_M_sig, selection_freq > 0)
+
+
+lasso_features_A_B_M_sig = annotate_ML(lasso_features_A_B_M_sig,ensembl)
+
+
+lasso_features_A_B_M_sig <- lasso_features_A_B_M_sig[
+  order(lasso_features_A_B_M_sig$mean_importance, decreasing = TRUE), ]
+
+write.csv(lasso_features_A_B_M_sig,file="~/ML/lasso_features_A_B_M_sig_M.csv")
+
+ggplot(lasso_features_A_B_M_sig[1:30,], aes(x = reorder(external_gene_name, mean_importance), y = mean_importance)) +
+  geom_col(aes(fill = selection_freq)) +
+  #geom_errorbar(aes(ymin = mean_importance - importance_sd, ymax = mean_importance + importance_sd),width = 0.2, color = "black") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue", name = "selection_freq") +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "Mean Importance",
+    title = "Top 30 Lasso"
+  ) +
+  theme_minimal()
+
+
+
+
+# Outer loop performance
+cat("Mean outer AUC:", round(mean(lasso_nested_A_B_M$outer_auc), 3),
+    "±", round(sd(lasso_nested_A_B_M$outer_auc), 3), "\n")
+
+
+
+
+
+ggsave(filename="~/Images/ML/top30_lasso_AvB_M.pdf",width = 4.5, height=4) 
+
+# ROC plot (using your existing function)
+plot_rocs(lasso_nested_A_B_M)
+
+ggsave(filename="~/Images/ML/roc_lasso_AvB_M.pdf",width = 4, height=4.2) 
+```
+
+elastic net
+
+```{r, fig.width=4.5, fig.height =4}
+
+
+
+enet_nested_A_B_M <- run_glmnet_nestedcv(X, Y, alpha = 0.5, outer_folds = 4, inner_folds = 3)
+
+
+
+enet_features_A_B_M_sig<-enet_nested_A_B_M$feature_stability
+enet_features_A_B_M_sig<- subset(enet_features_A_B_M_sig, selection_freq > 0)
+
+enet_features_A_B_M_sig = annotate_ML(enet_features_A_B_M_sig,ensembl)
+enet_features_A_B_M_sig$external_gene_name <- make.unique(enet_features_A_B_M_sig$external_gene_name)
+
+enet_features_A_B_M_sig <- enet_features_A_B_M_sig[
+  order(enet_features_A_B_M_sig$mean_importance, decreasing = TRUE), ]
+
+write.csv(enet_features_A_B_M_sig,file="~/ML/enet_features_A_B_M_sig_M.csv")
+
+ggplot(enet_features_A_B_M_sig[1:30,], aes(x = reorder(external_gene_name, mean_importance), y = mean_importance)) +
+  geom_col(aes(fill = selection_freq)) +
+  #geom_errorbar(aes(ymin = mean_importance - importance_sd, ymax = mean_importance + importance_sd),width = 0.2, color = "black") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue", name = "selection_freq") +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "Mean Importance",
+    title = "Top30 Elastic Net"
+  ) +
+  theme_minimal()
+
+
+# Outer loop performance
+cat("Mean outer AUC:", round(mean(enet_nested_A_B_M$outer_auc), 3),
+    "±", round(sd(enet_nested_A_B_M$outer_auc), 3), "\n")
+
+
+
+ggsave(filename="~/ML/top30_enet_AvB_M.pdf",width = 4.5, height=4) 
+
+# ROC plot (using your existing function)
+plot_rocs(enet_nested_A_B_M)
+
+ggsave(filename="~/ML/roc_enet_AvB_M.pdf",width = 4, height=4.2) 
+```
+
+Random forest
+
+```{r}
+
+# Run Random Forest (should now work without errors)
+
+rf_results_A_B_M <- run_rf_boruta_nestedcv(t(vst_forest_A_B_M_top) , Y, outer_folds = 4, inner_folds =3)
+
+top_rf_features_A_B_M_sig = subset(rf_results_A_B_M$feature_stability, selection_freq > 0)
+
+top_rf_features_A_B_M_sig = annotate_ML(top_rf_features_A_B_M_sig,ensembl)
+
+
+top_rf_features_A_B_M_sig <- top_rf_features_A_B_M_sig[
+  order(top_rf_features_A_B_M_sig$mean_importance, decreasing = TRUE), ]
+
+write.csv(top_rf_features_A_B_M_sig,file="~/ML/rf_features_A_B_M_sig_M.csv")
+```
+
+```{r, fig.width = 4.5, fig.height=4}
+
+
+ggplot(top_rf_features_A_B_M_sig[1:30,], aes(x = reorder(external_gene_name, mean_importance), y = mean_importance)) +
+  geom_col(aes(fill =selection_freq)) +
+  #geom_errorbar(aes(ymin = mean_importance - importance_sd, ymax = mean_importance + importance_sd), width = 0.2, color = "black") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue", name = "selection frequency") +
+  coord_flip() +
+  labs(
+    y = "Mean importance",
+    x = NULL,
+    title = "Top30 Random Forest"
+  ) +
+  theme_minimal()
+
+ggsave(filename="~/Images/ML/top30_rf_A_B_M_M.pdf",width = 4.5, height=4) 
+
+# ROC plot (using your existing function)
+plot_rocs(rf_results_A_B_M)
+
+ggsave(filename="~/Images/ML/roc_rf_A_B_M_M.pdf",width = 4, height=4.2) 
+```
+
+
+```{r, fig.height = 3.5, fig.width =5.5}
+selected_genes <- c(enet_features_A_B_M_sig$external_gene_name[1:15])
+selected_gene_ids <- c(enet_features_A_B_M_sig$feature[1:15])
+
+corrected_vstProg_A_B_M <- assay(vst_forest_A_B_M)
+
+mm_Prog_A_B_M <- model.matrix(~Group2, colData(vstProg_A_B_M))
+
+corrected_vstProg_A_B_M <- limma::removeBatchEffect(
+  corrected_vstProg_A_B_M,
+  #batch = vstProg_A_B_M$SeqBatch,       # Primary batch effect already removed with combateseq
+  batch2 = vstProg_A_B_M$Media,             # Secondary batch effect
+  design = mm_Prog_A_B_M            # Protect biological variables
+)
+
+mat_Prog_A_B_M= corrected_vstProg_A_B_M[selected_gene_ids,] - rowMeans(corrected_vstProg_A_B_M[selected_gene_ids,])
+
+
+vstProg_A_B_M_limma <- vst_forest_A_B_M
+assay(vstProg_A_B_M_limma) <- corrected_vstProg_A_B_M
+
+sampleinfo= data.frame(colData(vstProg_A_B_M_limma)[,c("Group2","SeqBatch")])
+sampleinfo=subset(sampleinfo, select= -SeqBatch)
+
+
+pdf("~/Images/ML/heatmap_A_B_M_M.pdf",width = 5.5, height=3.5)
+
+pheatmap(mat_Prog_A_B_M, annotation_col = sampleinfo, show_colnames = FALSE, labels_row = selected_genes, fontsize=10,color = colorRampPalette(rev(brewer.pal(n = 7, name ="RdBu")))(100),
+         annotation_colors = phenocols_M,
+         breaks = c(seq(min(mat_Prog_A_B_M), 0, length.out = 50),
+            seq(0.0000001, max(mat_Prog_A_B_M), length.out = 50)))
+
+dev.off()
+
+pheatmap(mat_Prog_A_B_M, annotation_col = sampleinfo, show_colnames = FALSE, labels_row = selected_genes, fontsize=10,color = colorRampPalette(rev(brewer.pal(n = 7, name ="RdBu")))(100),
+         annotation_colors = phenocols_M,
+         breaks = c(seq(min(mat_Prog_A_B_M), 0, length.out = 50),
+            seq(0.0000001, max(mat_Prog_A_B_M), length.out = 50)))
+```
+
+
+
+## DGE of B --> B2/C/D vs B --> B
+
+Subset to only include timepoint 1 and positive to look for biomarkers of progression (rather than changes that have already occured at timepoint2).  
+```{r , echo=FALSE}
+CardioProg_B_CD_M=subset(Cardioinfo_M,Time=="1" & Infected=="Pos" & Group2 %in% c("B1B1","B1B2.C.D") )
+
+
+CardioProg_B_CD_M=droplevels(CardioProg_B_CD_M)
+Counts_Prog_B_CD_M=subset(Cardiocountsonly_M, select=CardioProg_B_CD_M$Code)
+
+
+table(CardioProg_B_CD_M$Group2)
+```
+
+
+```{r designProgressors}
+ddsProg_B_CD_M=DESeqDataSetFromMatrix(countData = Counts_Prog_B_CD_M, 
+        colData =CardioProg_B_CD_M, design= ~ SeqBatch + Media + Group2)
+keepddsProg_B_CD_M= rowSums(counts(ddsProg_B_CD_M)>= 10) >=9 #keeps genes with at least 3 samples with 10 counts
+ddsProg_B_CD_M <- ddsProg_B_CD_M[keepddsProg_B_CD_M,]
+
+```
+
+```{r vstProg_A_Bressors, message=FALSE}
+vstProg_B_CD_M <- vst(ddsProg_B_CD_M, blind = FALSE)
+```
+
+
+### DEG
+
+Fit the model. Here some rows dont converge as shown in $betaConv, so we remove them.  
+```{r modelProgressors}
+#, results='hide', message=FALSE
+ddsProg_B_CD_M=DESeq(ddsProg_B_CD_M)
+```
+
+alpha sets FDR (default is 0.1), can also set lfcthreshold  
+```{r resultProg_B_CD_Mressors}
+
+resultProg_B_CD_M=results(ddsProg_B_CD_M,alpha = 0.05,contrast=c("Group2", "B1B2.C.D", "B1B1")) 
+summary(resultProg_B_CD_M)
+
+```
+
+
+Since contrast was  BC vs BB, the Up regulated genes are upregulated in BC compared to BB, and same from down regulated.  
+
+&nbsp;  
+
+
+```{r}
+
+annotProg_B_CD_M <- get_annotated_results(resultProg_B_CD_M, ensembl)
+
+SigAnnotProg_B_CD_M = subset(annotProg_B_CD_M, FDR < 0.05& (log2FC > 0.58 | log2FC< -0.58 ))
+write.csv(SigAnnotProg_B_CD_M,"~/DEG/SigAnnotProg_B_CD_M_M.csv")
+
+```
+
+Volcano plot of data, adjust xlim and ylim to fit all your data points.  The positive fold change indicates up regulated genes in BC compared to BB, and the negative fold change are those down regulated in BC compared to BB.  
+```{r volcanoProg_B_CD_Mressors, echo=FALSE, fig.height=6.5, fig.width=7}
+
+
+make_volcano(annotProg_B_CD_M, labs = c("RSAD2", "ISG15", "IFIT3", "LY6E" ,"OAS1", "OAS2", "OAS3" ,"MSR1" ), FDR_cutoff = 0.05, log2FC_cutoff = 0.58, title = "B->B v B->CD", up = "#ed5b37",down ="#ffa45e")
+
+
+ggsave(filename="~/Images/BCvBB_M_Volcano_labeled.pdf",height=6.5,width=7)
+```
+
+
+
+
+### GSEA GO
+
+&nbsp;
+All genes can be used in GSEA; GSEA aggregates the per gene statistics across genes within a gene set, therefore making it possible to detect situations where all genes in a predefined set change in a small but coordinated way. This is important since it is likely that many relevant phenotypic differences are manifested by small but consistent changes in a set of genes. the goal of GSEA is to determine whether the members of S are randomly distributed throughout the ranked gene list (L) or primarily found at the top or bottom. When the entire gene sets are evaluated, the estimated significance level is adjusted to account for multiple hypothesis testing and also q-values are calculated for FDR control.
+
+
+```{r}
+gsea_list_Prog_B_CD_M= BP_MF_GSEA(annotation = annotProg_B_CD_M,comp="BCvBB") 
+
+    
+
+
+simple_gsea_list_Prog_B_CD_M= simplify_gsea(gsea_list_Prog_B_CD_M, sim_cutoff = 0.70)
+simple_gsea_df_Prog_B_CD_M = gsea_simple_df(simple_gsea_list_Prog_B_CD_M)
+
+
+```
+
+```{r, fig.width=5.2, fig.height=3.2}
+for (i in seq_along(simple_gsea_df_Prog_B_CD_M)) {
+  
+  x <- simple_gsea_df_Prog_B_CD_M[[i]]
+  name <- names(simple_gsea_df_Prog_B_CD_M)[[i]]
+  
+  if (nrow(x)>10){
+    x <- x[1:10,]
+  }
+   
+p <- ggplot(x, aes(x = GeneRatio, y = Description, size = -log10(p.adjust), color = NES)) +
+    geom_point(na.rm = TRUE, aes(size = -log10(p.adjust), color = NES), shape = 21, fill = NA, stroke = 0.6, alpha = 0.9) +  
+    geom_point(na.rm = TRUE, aes(size = -log10(p.adjust), fill = NES), shape = 21, color = "black", stroke = 0.6)+  # Avoid plotting NA values
+    scale_size_continuous(range = c(0.25, 6)) +  # Avoid size for missing data
+    scale_color_gradient2(low = "#ffa45e", mid = "lightgrey",high = "#ed5b37",midpoint = 0) + 
+  scale_fill_gradient2(low = "#ffa45e", mid = "lightgrey",high = "#ed5b37",midpoint = 0) +
+    theme_minimal() +
+  #scale_alpha_continuous(range = c(0.3, 1)) + 
+    theme(axis.text.x = element_text(angle = 45, hjust = 1),
+          axis.text.y = element_text(size = 9),
+          legend.key.size = unit(0.4, 'cm'), #change legend key size
+          legend.title = element_text(size=9.5), #change legend title font size
+          legend.text = element_text(size=7))+
+  scale_y_discrete(labels = label_wrap(50), limits = rev) + ggtitle(name)+
+  ylab(NULL)
+
+print(p)
+
+  ggsave(p,filename=paste0("~/Images/GO/top10_gsea",name,"_M.pdf"),width = 4.5, height=2.8) 
+}
+```
+
+
+### Cross-validation
+
+first remove bathc effects using combat-seq
+
+In ComBat-seq, user may specify biological covariates, whose signals will be preserved in the adjusted data. If the user would like to specify one biological variable, they may use the group parameter:
+ 
+```{r}
+
+adj_Counts_Prog_B_CD_M <- ComBat_seq(as.matrix(Counts_Prog_B_CD_M), batch=CardioProg_B_CD_M$SeqBatch, group=CardioProg_B_CD_M$Group2)
+
+
+
+dds_forest_B_CD_M <- DESeqDataSetFromMatrix(
+  countData = adj_Counts_Prog_B_CD_M,  # Batch-corrected counts
+  colData = CardioProg_B_CD_M,
+  design = ~1            # Primary variable of interest (progressors vs. non-progressors)
+)
+
+keepdds_forest_B_CD_M= rowSums(counts(dds_forest_B_CD_M)>= 10) >=9
+dds_forest_B_CD_M <- dds_forest_B_CD_M[keepdds_forest_B_CD_M,]
+dds_forest_B_CD_M <- DESeq(dds_forest_B_CD_M)
+
+vst_forest_B_CD_M <- vst(dds_forest_B_CD_M, blind = FALSE)
+vst_forest_B_CD_M_matrix<-assay(vst_forest_B_CD_M)
+gene_vars <- apply(vst_forest_B_CD_M_matrix, 1, var)
+vst_forest_B_CD_M_top <- vst_forest_B_CD_M_matrix[gene_vars > quantile(gene_vars, 0.4), ]
+
+```
+
+
+lasso nested repeated cross-validation for training and validaiton
+
+```{r}
+
+library(caret)
+library(glmnet)
+library(pROC)
+
+set.seed(12345)
+# Create k outer folds
+X <- as.matrix(t(vst_forest_B_CD_M_top))  # Ensure it's a matrix (genes as columns, samples as rows)
+Y <- factor(CardioProg_B_CD_M$Group2)  # Ensure it's a factor (0 = non-progressor, 1 = progressor)
+
+```
+
+```{r}
+run_glmnet_nestedcv<- function(X, y, alpha = 1,outer_folds = 5, inner_folds = 3) {
+  # Create outer folds
+  outer_cv <- createFolds(Y, k = outer_folds, list = TRUE, returnTrain = TRUE)
+  
+  outer_auc <- numeric(length(outer_cv))
+  all_preds <- list()
+  feature_list <- list()
+  importance_matrix <- matrix(0, nrow = length(outer_cv), ncol = ncol(X))
+  colnames(importance_matrix) <- colnames(X)
+  
+  
+  for (i in seq_along(outer_cv)) {
+  cat("Outer fold", i, "of", outer_folds, "\n")
+  
+  train_idx <- outer_cv[[i]]
+  test_idx  <- setdiff(seq_along(Y), train_idx)
+  
+  X_train <- as.matrix(X[train_idx, ])
+  Y_train <- Y[train_idx]
+  X_test  <- as.matrix(X[test_idx, ])
+  Y_test  <- Y[test_idx]
+  
+    # 3-fold CV with 5 repeats
+    ctrl <- trainControl(
+      method = "repeatedcv",
+      number = inner_folds,
+      repeats = 5,
+      classProbs = TRUE,
+      summaryFunction = twoClassSummary
+    )
+    
+    set.seed(i)
+    # Train model
+    model <- train(
+      x = X_train,
+      y = as.factor(Y_train),
+      method = "glmnet",
+      trControl = ctrl,
+      tuneGrid = expand.grid(alpha = alpha, lambda = 10^seq(-3, 0, length = 20)),
+      metric = "ROC"
+    )
+    
+    # --- Predict on outer test fold ---
+    pred_prob <- predict(model, X_test, type = "prob")[, 2]
+    roc_obj <- roc(Y_test, pred_prob)
+    auc_val <- auc(roc_obj)
+    outer_auc[i] <- auc_val
+    
+    # --- Store individual ROC data for later plotting ---
+    roc_df <- data.frame(
+      fold = i,
+      sensitivity = roc_obj$sensitivities,
+      one_minus_spec = 1 - roc_obj$specificities
+    )
+    all_preds[[i]] <- data.frame(
+      fold = i,
+      true_label = Y_test,
+      pred_prob = pred_prob
+    )
+  
+    # --- Extract coefficients (non-zero only) ---
+    best_lambda <- model$bestTune$lambda
+    final_fit <- glmnet(X_train, Y_train, alpha = alpha, family = "binomial", lambda = best_lambda)
+    coefs <- as.matrix(coef(final_fit))
+    nonzero <- rownames(coefs)[coefs != 0]
+    nonzero <- nonzero[nonzero != "(Intercept)"]
+    
+    # --- Save feature list ---
+    feature_list[[i]] <- data.frame(feature = nonzero, coef = as.numeric(coefs[nonzero, ]))
+    
+    # --- Store importance ---
+    imp <- varImp(model)$importance
+    matched_imp <- imp[match(colnames(X), rownames(imp)), 1]
+    importance_matrix[i, ] <- ifelse(is.na(matched_imp), 0, matched_imp)
+  }
+  
+  # --- Feature stability ---
+  feature_stability <- bind_rows(feature_list) %>%
+    group_by(feature) %>%
+    summarise(
+      selection_freq = n() / length(outer_cv),
+      mean_coef = mean(coef)
+    ) %>%
+    arrange(desc(selection_freq))
+  
+  # --- Combine importance ---
+  importance_df <- data.frame(
+    feature = colnames(X),
+    mean_importance = colMeans(importance_matrix),
+    importance_sd = apply(importance_matrix, 2, sd)
+  )
+  
+  feature_stability <- merge(feature_stability, importance_df, by = "feature", all.x = TRUE)
+  
+  # --- Combine all predictions ---
+  all_preds_df <- bind_rows(all_preds)
+  
+  # --- Return results ---
+  list(
+    auc = mean(outer_auc),
+    auc_sd = sd(outer_auc),
+    outer_auc = outer_auc,
+    feature_stability = feature_stability,
+    all_preds = all_preds_df
+  )
+}
+
+
+
+plot_rocs <- function(lasso_res) {
+  roc_data <- lasso_res$all_preds
+
+  # Initialize ggplot
+  p <- ggplot() +
+    # Add reference line
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "black")
+
+  # Plot individual outer fold ROC curves
+  for (i in unique(roc_data$fold)) {
+    fold_data <- roc_data[roc_data$fold == i, ]
+    fold_roc <- roc(fold_data$true_label, fold_data$pred_prob)
+
+    fold_df <- data.frame(
+      x = 1 - rev(fold_roc$specificities),  # ascending 1 - specificity
+      y = rev(fold_roc$sensitivities)       # ascending sensitivity
+    )
+
+    p <- p + geom_step(
+      data = fold_df,
+      aes(x = x, y = y),
+      color = "pink",
+      alpha = 0.8,
+      linewidth = 0.7
+    )
+  }
+
+  # Plot overall ROC (all outer folds combined)
+  overall_roc <- roc(roc_data$true_label, roc_data$pred_prob)
+  overall_df <- data.frame(
+    x = 1 - rev(overall_roc$specificities),
+    y = rev(overall_roc$sensitivities)
+  )
+
+  set.seed(12345)
+  ci_auc <- ci.auc(overall_roc, method = "bootstrap")
+
+  p <- p + geom_step(
+    data = overall_df,
+    aes(x = x, y = y),
+    color = "red",
+    linewidth = 1
+  ) +
+    labs(
+      title = "Nested CV ROC Curve",
+      subtitle = sprintf("AUC = %.3f (95%% CI: %.3f–%.3f)",
+                         auc(overall_roc), ci_auc[1], ci_auc[3]),
+      x = "1 - Specificity",
+      y = "Sensitivity"
+    ) +
+    coord_equal() +
+    theme_minimal()
+
+  return(p)
+}
+
+```
+
+```{r, fig.width=4.5, fig.height=4.0}
+lasso_nested_B_CD_M <- run_glmnet_nestedcv(X, Y, alpha = 1, outer_folds = 5, inner_folds = 3)
+
+
+
+lasso_features_B_CD_M_sig<-lasso_nested_B_CD_M$feature_stability
+lasso_features_B_CD_M_sig<- subset(lasso_features_B_CD_M_sig, selection_freq > 0)
+
+lasso_features_B_CD_M_sig = annotate_ML(lasso_features_B_CD_M_sig,ensembl)
+
+
+
+lasso_features_B_CD_M_sig <- lasso_features_B_CD_M_sig[
+  order(lasso_features_B_CD_M_sig$mean_importance, decreasing = TRUE), ]
+
+write.csv(lasso_features_B_CD_M_sig,file="~/ML/lasso_features_B_CD_M_sig_M.csv")
+
+ggplot(lasso_features_B_CD_M_sig[1:30,], aes(x = reorder(external_gene_name, mean_importance), y = mean_importance)) +
+  geom_col(aes(fill = selection_freq)) +
+  #geom_errorbar(aes(ymin = mean_importance - importance_sd, ymax = mean_importance + importance_sd),width = 0.2, color = "black") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue", name = "selection_freq") +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "Mean Importance",
+    title = "Top 30 Lasso"
+  ) +
+  theme_minimal()
+
+
+
+
+# Outer loop performance
+cat("Mean outer AUC:", round(mean(lasso_nested_B_CD_M$outer_auc), 3),
+    "±", round(sd(lasso_nested_B_CD_M$outer_auc), 3), "\n")
+
+
+
+
+
+ggsave(filename="~/Images/ML/top30_lasso_BC_D_M.pdf",width = 4.5, height=4) 
+
+# ROC plot (using your existing function)
+plot_rocs(lasso_nested_B_CD_M)
+
+ggsave(filename="~/Images/ML/roc_lasso_BC_D_M.pdf",width = 4, height=4.2) 
+```
+
+elastic net
+
+```{r, fig.width=4.5, fig.height =4}
+
+
+
+enet_nested_B_CD_M <- run_glmnet_nestedcv(X, Y, alpha = 0.5, outer_folds = 5, inner_folds = 3)
+
+
+
+enet_features_B_CD_M_sig<-enet_nested_B_CD_M$feature_stability
+enet_features_B_CD_M_sig<- subset(enet_features_B_CD_M_sig, selection_freq > 0)
+
+enet_features_B_CD_M_sig = annotate_ML(enet_features_B_CD_M_sig,ensembl)
+
+
+enet_features_B_CD_M_sig <- enet_features_B_CD_M_sig[
+  order(enet_features_B_CD_M_sig$mean_importance, decreasing = TRUE), ]
+
+write.csv(enet_features_B_CD_M_sig,file="~/ML/enet_features_B_CD_M_sig_M.csv")
+
+
+
+ggplot(enet_features_B_CD_M_sig[1:30,], aes(x = reorder(external_gene_name, mean_importance), y = mean_importance)) +
+  geom_col(aes(fill = selection_freq)) +
+  #geom_errorbar(aes(ymin = mean_importance - importance_sd, ymax = mean_importance + importance_sd),width = 0.2, color = "black") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue", name = "selection_freq") +
+  coord_flip() +
+  labs(
+    x = NULL,
+    y = "Mean Importance",
+    title = "Top30 Elastic Net"
+  ) +
+  theme_minimal()
+
+
+# Outer loop performance
+cat("Mean outer AUC:", round(mean(enet_nested_B_CD_M$outer_auc), 3),
+    "±", round(sd(enet_nested_B_CD_M$outer_auc), 3), "\n")
+
+
+
+ggsave(filename="~/Images/ML/top30_enet_BC_D_M.pdf",width = 4.5, height=4) 
+
+# ROC plot (using your existing function)
+plot_rocs(enet_nested_B_CD_M)
+
+ggsave(filename="~/Images/ML/roc_enet_BC_D_M.pdf",width = 4, height=4.2) 
+```
+
+random. forest
+```{r}
+library(Boruta)
+run_rf_boruta_nestedcv<- function(X, Y, outer_folds = 5, inner_folds = 3) {
+  
+  set.seed(12345)
+  # Create outer folds
+  outer_cv <- createFolds(Y, k = outer_folds, list = TRUE, returnTrain = TRUE)
+  
+  
+  outer_auc <- numeric(length(outer_cv))
+  all_preds <- list()
+  feature_list <- list()
+
+  importance_matrix <- matrix(0, nrow = length(outer_cv), ncol = ncol(X))
+  mda_matrix <- matrix(0, nrow = length(outer_cv), ncol = ncol(X))
+  gini_matrix <- matrix(0, nrow = length(outer_cv), ncol = ncol(X))
+  colnames(importance_matrix) <- colnames(X)
+  colnames(mda_matrix) <- colnames(X)
+  colnames(gini_matrix) <- colnames(X)
+
+  
+  for (i in seq_along(outer_cv)) {
+  cat("Outer fold", i, "of", outer_folds, "\n")
+  
+  train_idx <- outer_cv[[i]]
+  test_idx  <- setdiff(seq_along(Y), train_idx)
+  
+  X_train <- as.matrix(X[train_idx, ])
+  Y_train <- Y[train_idx]
+  X_test  <- as.matrix(X[test_idx, ])
+  Y_test  <- Y[test_idx]
+  
+    # 3-fold CV with 5 repeats with Boruta feature selection (ONLY on training data)
+    set.seed(i) # For reproducibility
+    boruta <- Boruta(X_train, as.factor(Y_train), maxRuns = 50) 
+    selected_features <- getSelectedAttributes(boruta, withTentative = TRUE)
+    
+    X_train_boruta <- X_train[, selected_features, drop = FALSE]
+    X_test_boruta  <- X_test[, selected_features, drop = FALSE]
+    
+    # 3. Train RF on Boruta-selected features
+    ctrl <- trainControl(
+      method = "none",  # no resampling; rely on OOB
+       classProbs = TRUE,
+      summaryFunction = twoClassSummary
+      )
+    
+    p <- length(selected_features)
+
+
+    model <- train(
+      x = X_train_boruta,
+      y = make.names(Y_train), # caret requires valid factor names
+      method = "rf",
+      trControl = ctrl,
+      tuneGrid = data.frame(mtry = floor(sqrt(ncol(X)))),
+      metric = "ROC",
+      importance = TRUE
+    )
+    
+    
+    # --- Predict on outer test fold ---
+    pred_prob <- predict(model, X_test_boruta, type = "prob")[, 2]
+    roc_obj <- roc(Y_test, pred_prob)
+    auc_val <- auc(roc_obj)
+    outer_auc[i] <- auc_val
+    
+    # --- Store individual ROC data for later plotting ---
+    roc_df <- data.frame(
+      fold = i,
+      sensitivity = roc_obj$sensitivities,
+      one_minus_spec = 1 - roc_obj$specificities
+    )
+    
+    # --- Save predictions ---
+    all_preds[[i]] <- data.frame(
+      fold = i,
+      true_label = Y_test,
+      pred_prob = pred_prob
+    )
+  
+
+    # --- Save feature list ---
+    feature_list[[i]] <- data.frame(feature = selected_features)
+    
+
+    # SAFELY store variable importance
+    imp <- varImp(model)$importance
+    
+    mda  <- importance(model$finalModel)[,"MeanDecreaseAccuracy"]
+    gini <- importance(model$finalModel)[,"MeanDecreaseGini"]
+    
+    matched_imp <- imp[match(colnames(X), rownames(imp)), 1]
+    matched_mda <-  mda[match(colnames(X), names(mda))]
+    matched_gini <- gini[match(colnames(X), names(gini))]
+    
+    importance_matrix[i, ] <- ifelse(is.na(matched_imp), 0, matched_imp)
+    mda_matrix[i, ] <- ifelse(is.na(matched_mda), 0, matched_mda)
+    gini_matrix[i, ] <- ifelse(is.na(matched_gini), 0, matched_gini)
+    
+  }
+
+  
+  # --- Feature stability ---
+  feature_stability <- bind_rows(feature_list) %>%
+    group_by(feature) %>%
+    summarise(selection_freq = n() / length(outer_cv)) %>%
+    arrange(desc(selection_freq))
+  
+  # --- Combine importance ---
+  importance_df <- data.frame(
+    feature = colnames(X),
+    mean_importance = colMeans(importance_matrix),
+    importance_sd = apply(importance_matrix, 2, sd),
+    Mean_MDA = colMeans(mda_matrix, na.rm = TRUE),
+    SD_MDA = apply(mda_matrix, 2, sd, na.rm = TRUE),
+    Mean_Gini = colMeans(gini_matrix, na.rm = TRUE),
+    SD_Gini = apply(gini_matrix, 2, sd, na.rm = TRUE)
+  )
+  
+  feature_stability <- merge(feature_stability, importance_df, by = "feature", all.x = TRUE)
+  
+  # --- Combine all predictions ---
+  all_preds_df <- bind_rows(all_preds)
+  
+  # --- Return results ---
+  list(
+    auc = mean(outer_auc),
+    auc_sd = sd(outer_auc),
+    outer_auc = outer_auc,
+    feature_stability = feature_stability,
+    all_preds = all_preds_df
+  )
+}
+
+
+```
+
+```{r}
+
+# Run Random Forest (should now work without errors)
+
+rf_results_B_CD_M <- run_rf_boruta_nestedcv(t(vst_forest_B_CD_M_top) , Y, outer_folds = 5, inner_folds =3)
+
+top_rf_features_B_CD_M_sig = subset(rf_results_B_CD_M$feature_stability, selection_freq > 0)
+
+top_rf_features_B_CD_M_sig = annotate_ML(top_rf_features_B_CD_M_sig,ensembl)
+
+
+top_rf_features_B_CD_M_sig <- top_rf_features_B_CD_M_sig[
+  order(top_rf_features_B_CD_M_sig$mean_importance, decreasing = TRUE), ]
+
+write.csv(top_rf_features_B_CD_M_sig,file="~/ML/rf_features_B_CD_M_sig_M.csv")
+
+```
+
+```{r, fig.width = 4.5, fig.height=4}
+
+
+ggplot(top_rf_features_B_CD_M_sig[1:30,], aes(x = reorder(external_gene_name, mean_importance), y = mean_importance)) +
+  geom_col(aes(fill =selection_freq)) +
+  #geom_errorbar(aes(ymin = mean_importance - importance_sd, ymax = mean_importance + importance_sd), width = 0.2, color = "black") +
+  scale_fill_gradient(low = "lightblue", high = "darkblue", name = "selection frequency") +
+  coord_flip() +
+  labs(
+    y = "Mean importance",
+    x = NULL,
+    title = "Top30 Random Forest"
+  ) +
+  theme_minimal()
+
+ggsave(filename="~/Images/ML/top30_rf_BC_D_M.pdf",width = 4.5, height=4) 
+
+# ROC plot (using your existing function)
+plot_rocs(rf_results_B_CD_M)
+
+ggsave(filename="~/Images/ML/roc_rf_BC_D_M.pdf",width = 4, height=4.2) 
+```
+
+
+```{r, fig.height = 3.5, fig.width =5.5}
+selected_genes <- c(enet_features_B_CD_M_sig$external_gene_name[1:15])
+selected_gene_ids <- subset(annotProg_B_CD_M, external_gene_name %in% selected_genes)$ensembl_gene_id
+
+corrected_vstProg_B_CD_M <- assay(vst_forest_B_CD_M)
+
+mm_Prog_B_CD_M <- model.matrix(~Group2, colData(vst_forest_B_CD_M))
+
+corrected_vstProg_B_CD_M <- limma::removeBatchEffect(
+  corrected_vstProg_B_CD_M,
+  #batch = vstProg_B_CD_M$SeqBatch,       # Primary batch effect already removed with combatseq
+  batch2 = vstProg_B_CD_M$Media,             # Secondary batch effect
+  design = mm_Prog_B_CD_M            # Protect biological variables
+)
+
+mat_Prog_B_CD_M= corrected_vstProg_B_CD_M[selected_gene_ids,] - rowMeans(corrected_vstProg_B_CD_M[selected_gene_ids,])
+
+vstProg_B_CD_M_limma <- vst_forest_B_CD_M
+assay(vstProg_B_CD_M_limma) <- corrected_vstProg_B_CD_M
+
+sampleinfo= data.frame(colData(vstProg_B_CD_M_limma )[,c("Group2","SeqBatch")])
+
+sampleinfo= data.frame(colData(vstProg_B_CD_M)[,c("Group2","SeqBatch")])
+sampleinfo=subset(sampleinfo, select= -SeqBatch)
+
+pdf("~/Images/ML/heatmap_BC_D_M.pdf",width = 5.5, height=3.5)
+
+pheatmap(mat_Prog_B_CD_M, annotation_col = sampleinfo, show_colnames = FALSE, labels_row = selected_genes, fontsize=10,color = colorRampPalette(rev(brewer.pal(n = 7, name ="RdBu")))(100),
+         annotation_colors = phenocols_M,
+         breaks = c(seq(min(mat_Prog_B_CD_M), 0, length.out = 50),
+            seq(0.0000001, max(mat_Prog_B_CD_M), length.out = 50)))
+
+dev.off()
+
+pheatmap(mat_Prog_B_CD_M, annotation_col = sampleinfo, show_colnames = FALSE, labels_row = selected_genes, fontsize=10,color = colorRampPalette(rev(brewer.pal(n = 7, name ="RdBu")))(100),
+         annotation_colors = phenocols_M,
+         breaks = c(seq(min(mat_Prog_B_CD_M), 0, length.out = 50),
+            seq(0.0000001, max(mat_Prog_B_CD_M), length.out = 50)))
+
+```
+
+#### overlap with females
+```{r, fig.width=7.2, fig.height=5}
+
+
+enet_M_F<- list(Male = enet_features_B_CD_M_sig$feature,
+                Female = enet_features_B_CD_F_sig$feature)
+
+
+ggvenn(
+  enet_M_F,
+  fill_color = c("#ed5b37",  "#8b2eb3"),
+  stroke_size = 0.5, set_name_size = 8, text_size = 9)
+
+ggsave(filename="~/Images/ML/enet_venn_BBvB2CD.pdf",width = 7.2, height=5)
+
+lasso_M_F<- list(Male = lasso_features_B_CD_M_sig$feature,
+                Female = lasso_features_B_CD_F_sig$feature)
+
+
+ggvenn(
+  lasso_M_F,
+  fill_color = c("#ed5b37",  "#8b2eb3"),
+  stroke_size = 0.5, set_name_size = 8, text_size = 9)
+ggsave(filename="~/Images/ML/lasso_venn_BBvB2CD.pdf",width = 7.2, height=5)
+
+rf_M_F<- list(Male = top_rf_features_B_CD_M_sig$feature,
+                Female = top_rf_features_B_CD_F_sig$feature)
+
+ggvenn(
+  rf_M_F,
+  fill_color = c("#ed5b37",  "#8b2eb3"),
+  stroke_size = 0.5, set_name_size = 8, text_size = 9)
+ggsave(filename="~/Images/ML/rf_venn_BBvB2CD.pdf",width = 7.2, height=5)
+
+
+
+
+enet_M_F_AB<- list(Male = enet_features_A_B_M_sig$feature,
+                Female = enet_features_A_B_F_sig$feature)
+
+ggvenn(
+  enet_M_F_AB,
+  fill_color = c("#ed5b37",  "#8b2eb3"),
+  stroke_size = 0.5, set_name_size = 8, text_size = 9)
+
+ggsave(filename="~/Images/ML/enet_venn_AAvAB1B2.pdf",width = 7.2, height=5)
+
+lasso_M_F_AB<- list(Male = lasso_features_A_B_M_sig$feature,
+                Female = lasso_features_A_B_F_sig$feature)
+
+
+ggvenn(
+  lasso_M_F_AB,
+  fill_color = c("#ed5b37",  "#8b2eb3"),
+  stroke_size = 0.5, set_name_size = 8, text_size = 9)
+ggsave(filename="~/Images/ML/lasso_venn_AAvAB1B2.pdf",width = 7.2, height=5)
+
+rf_M_F_AB<- list(Male = top_rf_features_A_B_M_sig$feature,
+                Female = top_rf_features_A_B_F_sig$feature)
+
+ggvenn(
+  rf_M_F_AB,
+  fill_color = c("#ed5b37",  "#8b2eb3"),
+  stroke_size = 0.5, set_name_size = 8, text_size = 9)
+ggsave(filename="~/Images/ML/rf_venn_AAvAB1B2.pdf",width = 7.2, height=5)
+```
+
+
