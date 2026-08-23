@@ -1,0 +1,41 @@
+#!/bin/bash
+
+ml anaconda
+
+
+Cardio_Folder="/Path/to/Cardio"
+Genome_Folder="/Path/to/Genomes"
+
+# Generate decoy-aware transcriptome based on whole genome for SALMON
+grep "^>" <(gunzip -c ${Genome_Folder}/Human38/release109/Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz) | cut -d " " -f 1 > GRCh38_109_decoys.txt
+sed -i.bak -e 's/>//g' GRCh38_109_decoys.txt
+
+cat ${Genome_Folder}/Human38/release109/Homo_sapiens.GRCh38.cdna.all.fa.gz \
+${Genome_Folder}/Human38/release109/Homo_sapiens.GRCh38.ncrna.fa.gz \
+${Genome_Folder}/Human38/release109/Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz \
+> GRCm38_109_cDNA_ncDNA_genome.fa.gz
+
+salmon index -t GRCm38_109_cDNA_ncDNA_genome.fa.gz -d GRCh38_109_decoys.txt -p 12 -i salmon_index
+
+
+# quantify
+for path in /${Cardio_Folder}/Trimmed/*fq.gz; do
+        SAMPLEID="$(basename "${path}")"
+        if [[ "$(basename "${path}")" == *"_1."* ]]
+        then
+            	SAMPLEID=${SAMPLEID::-8}
+        else
+            	continue
+        fi
+
+        echo $SAMPLEID
+
+        salmon quant -i ${Genome_Folder}/SalmonIndex/salmon_index \
+        -l IU \
+        -1 ${Cardio_Folder}/Trimmed/${SAMPLEID}_1.fq.gz \
+        -2 ${Cardio_Folder}/Trimmed/${SAMPLEID}_2.fq.gz \
+        --gcBias \
+        -p 8 \
+        -o ${SAMPLEID}_transcript_quant
+
+done
