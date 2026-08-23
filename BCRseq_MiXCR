@@ -1,0 +1,130 @@
+#!/bin/bash
+
+ml anaconda
+
+
+#set main directory paths
+BCRseq_data="/path/to/BCR_seq/fastq2"
+BCRseq_analysis="/path/to/BCRseq_output"
+Genome_Folder="/path/to/Genomes"
+
+cd "$BCRseq_analysis"
+
+
+# Create the output directories if they don't already exist
+for dir in "FASTqc_raw" "multiqc" "FASTqc_clean" "Trimmed" "MIXCR_clean"; do
+    mkdir -p "$dir"
+done
+
+    #FASTqc to check quality.
+    fastqc \
+    --threads 8 \
+    ${BCRseq_data}/*.fastq.gz \
+    --outdir ${BCRseq_analysis}/FASTqc_raw
+
+    multiqc ${BCRseq_analysis}/FASTqc_raw \
+    --filename BCRseq_Colhearts_raw.html \
+    -o ${BCRseq_analysis}/multiqc
+
+
+
+    for path in ${BCRseq_data}/concat/*fastq.gz; do
+            SAMPLEID="$(basename "${path}")"
+            if [[ "$(basename "${path}")" == *"R1_001"* ]]
+            then
+                	SAMPLEID=${SAMPLEID::-16}
+            else
+                	continue
+            fi
+
+            #BBDuk for trimming
+            bbduk.sh \
+            in1=${BCRseq_data}/concat/${SAMPLEID}_R1_001.fastq.gz \
+            in2=${BCRseq_data}/concat/${SAMPLEID}_R2_001.fastq.gz \
+            out1=${BCRseq_analysis}/Trimmed/${SAMPLEID}_R1_001.fastq.gz \
+            out2=${BCRseq_analysis}/Trimmed/${SAMPLEID}_R2_001.fastq.gz \
+            t=12 \
+            ref=/home/cduque1/.conda/envs/bcrseq/opt/bbmap-39.80-0/resources/adapters.fa \
+            ktrim=r \
+            k=23 \
+            mink=11 \
+            hdist=1 \
+            rcomp=t \
+            tbo \
+            tpe \
+            qtrim=r \
+            trimq=10 \
+            minlen=100 \
+            trimpolyg=10
+
+    done
+
+
+    #FASTqc to check quality post trim
+    fastqc \
+    --threads 8 \
+    ${BCRseq_analysis}/Trimmed/*.fastq.gz \
+    --outdir ${BCRseq_analysis}/FASTqc_clean
+
+    multiqc ${BCRseq_analysis}/FASTqc_clean \
+    --filename BCRseq_Colhearts_clean.html \
+    -o ${BCRseq_analysis}/multiqc
+
+
+
+    for path in ${BCRseq_analysis}/Trimmed/*fastq.gz; do
+            SAMPLEID="$(basename "${path}")"
+            if [[ "$(basename "${path}")" == *"R1_001"* ]]
+            then
+                	SAMPLEID=${SAMPLEID::-16}
+            else
+                	continue
+            fi
+
+            mixcr analyze takara-human-rna-bcr-umi-smartseq \
+                ${BCRseq_analysis}/Trimmed/${SAMPLEID}_R1_001.fastq.gz \
+                ${BCRseq_analysis}/Trimmed/${SAMPLEID}_R2_001.fastq.gz \
+                MIXCR_clean/${SAMPLEID}
+
+            mixcr exportReports \
+                MIXCR_clean/${SAMPLEID}.clns \
+                MIXCR_clean/${SAMPLEID}.report.txt
+
+
+    done
+
+
+    for path in ${BCRseq_analysis}/Trimmed/*fastq.gz; do
+            SAMPLEID="$(basename "${path}")"
+            if [[ "$(basename "${path}")" == *"R1_001"* ]]
+            then
+                	SAMPLEID=${SAMPLEID::-16}
+            else
+                	continue
+            fi
+
+            #perform allele inference to separate true allelic variants from somatic hypermutations. You must only run the clns from the same patient
+            mixcr findAlleles \
+                --report MIXCR_clean/lineage/${SAMPLEID}.findAlleles.report.txt \
+                --export-alleles-mutations MIXCR_clean/lineage/${SAMPLEID}_alleles.tsv \
+                --export-library MIXCR_clean/lineage/${SAMPLEID}_alleles.json \
+                --output-template {file_dir_path}/lineage/{file_name}.reassigned.clns \
+                MIXCR_clean/${SAMPLEID}.clns
+
+            #export clonotype tables in human-readable format
+            mixcr exportClones \
+                 MIXCR_clean/lineage/${SAMPLEID}.reassigned.clns \
+                 MIXCR_clean/lineage/${SAMPLEID}.tsv
+
+            mixcr exportClones \
+                 --export-productive-clones-only \
+                 --chains IGH \
+                 -vHit \
+                 -dHit \
+                 -jHit \
+                 -cHit \
+                 -nMutationsRate VRegionTrimmed \
+                 MIXCR_clean/lineage/${SAMPLEID}.reassigned.clns \
+                 MIXCR_clean/lineage/${SAMPLEID}_besthit_productive.tsv
+
+        done
