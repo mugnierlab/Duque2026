@@ -1,10 +1,10 @@
 #!/bin/bash
 
-export PATH=/home/cduque1/scratch4-mmugnie1/carolina/10x/cellranger-8.0.1:$PATH
+export PATH=/path/to/10x/cellranger-8.0.1:$PATH
 
 #set main directory paths
-singlecell_Folder="/home/cduque1/scratch4-mmugnie1/carolina/Bol_single_cell"
-human_transcriptome_Folder="/home/cduque1/scratch4-mmugnie1/carolina/10x/10x_transcriptomes/refdata-gex-GRCh38-2024-A"
+singlecell_Folder="/path/to/single_cell_folder"
+human_transcriptome_Folder="/path/to/10x/10x_transcriptomes/refdata-gex-GRCh38-2024-A"
 
 ## the human transcriptome was downloaded from 10x. they used the following fasta and gtf
 ### fasta_url="http://ftp.ensembl.org/pub/release-109/fasta/homo_sfasta_in="${source}/Homo_sapiens.GRCh38.dna.primary_assembly.fa"
@@ -49,7 +49,7 @@ for path in ${singlecell_Folder}/AN00019791_10X_RawData_Outs/*; do
 done
 
 
-genome="/home/cduque1/scratch4-mmugnie1/carolina/Genomes/Human38/release109"
+genome="/path/to/Human38/release109"
 
 
 for folder in ${singlecell_Folder}/counts/*; do
