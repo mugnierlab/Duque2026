@@ -1,0 +1,67 @@
+#!/bin/bash
+
+export PATH=/home/cduque1/scratch4-mmugnie1/carolina/10x/cellranger-8.0.1:$PATH
+
+#set main directory paths
+singlecell_Folder="/home/cduque1/scratch4-mmugnie1/carolina/Bol_single_cell"
+human_transcriptome_Folder="/home/cduque1/scratch4-mmugnie1/carolina/10x/10x_transcriptomes/refdata-gex-GRCh38-2024-A"
+
+## the human transcriptome was downloaded from 10x. they used the following fasta and gtf
+### fasta_url="http://ftp.ensembl.org/pub/release-109/fasta/homo_sfasta_in="${source}/Homo_sapiens.GRCh38.dna.primary_assembly.fa"
+### gtf_url="http://ftp.ebi.ac.uk/pub/databases/gencode/Gencode_human/release_44/gencode.v44.primary_assembly.annotation.gtf.gz"
+
+cd "${singlecell_Folder}"
+
+# Create the output directories if they don't already exist
+for dir in "counts" "library_csv"; do
+    mkdir -p "${dir}"
+done
+
+for path in ${singlecell_Folder}/AN00019791_10X_RawData_Outs/*; do
+        SAMPLEID="$(basename "${path}")"
+        if [[ -d "${path}" && "$(basename "${path}")" == *"FB"* ]]
+        then
+            	SAMPLEID=${SAMPLEID::-3}
+        else
+            	continue
+        fi
+
+        #make library.csv for each samples
+        CSV_FILE="${singlecell_Folder}/library_csv/${SAMPLEID}_library.csv"
+
+        echo "fastqs,sample,library_type" > "$CSV_FILE"
+        echo "${singlecell_Folder}/AN00019791_10X_RawData_Outs/${SAMPLEID}-FB/22CVV3LT4,${SAMPLEID}-FB,Antibody Capture"  >> "$CSV_FILE"
+        echo "${singlecell_Folder}/AN00019791_10X_RawData_Outs/${SAMPLEID}-GEX/22CVV3LT4,${SAMPLEID}-GEX,Gene Expression"  >> "$CSV_FILE"
+
+        echo "Created library CSV for ${SAMPLEID}"
+
+
+        cellranger count \
+        --id=${SAMPLEID} \
+        --libraries="${singlecell_Folder}/library_csv/${SAMPLEID}_library.csv" \
+        --transcriptome=${human_transcriptome_Folder} \
+        --feature-ref="${singlecell_Folder}/TotalSeq_C_TBNK_and_HTO.csv" \
+        --create-bam=true \
+        --localcores=18 \
+        --nosecondary
+
+
+done
+
+
+genome="/home/cduque1/scratch4-mmugnie1/carolina/Genomes/Human38/release109"
+
+
+for folder in ${singlecell_Folder}/counts/*; do
+
+    Pool_ID="$(basename "${folder}")"
+    mkdir -p "${singlecell_Folder}/vartrix/${Pool_ID}"
+
+    vartrix -v "${genome}/gencodechr_1000GENOMES-phase_3.vcf.gz" \
+    -b "${singlecell_Folder}/counts/${Pool_ID}/${Pool_ID}_outs/${Pool_ID}_possorted_genome_bam.bam" \ #path to cellranger bam. This BAM must have the CB tag to define the barcodes of cell barcodes. Must also have an index file.
+    -f "${human_transcriptome_Folder}/fasta/genome.fa" \ #A FASTA file for the reference genome used in the BAM. Must have a index file
+    -c "${singlecell_Folder}/counts/${Pool_ID}/${Pool_ID}_outs/${Pool_ID}_filtered_feature_bc_matrix/barcodes.tsv.gz" \ # path to cellranger barcode file that defines which barcodes were called as cells.
+    -o "${singlecell_Folder}/vartrix/${Pool_ID}_matrix.mtx" \
+    --threads 8
+
+done
