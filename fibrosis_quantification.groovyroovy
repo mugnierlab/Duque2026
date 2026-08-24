@@ -1,0 +1,57 @@
+// Set image type and stain vectors
+setImageType('BRIGHTFIELD_OTHER');
+setColorDeconvolutionStains('{"Name" : "Trichrome", "Stain 1" : "Fiber_stain", "Values 1" : "0.86277 0.47688 0.16796", "Stain 2" : "plasma_stain", "Values 2" : "0.23607 0.84426 0.48115", "Background" : " 215 223 198"}');
+setColorDeconvolutionStains('{"Name" : "Trichrome_vectors_colhearts_batch1", "Stain 1" : "Fiber_stain", "Values 1" : "0.80332 0.58763 0.09684", "Stain 2" : "plasma_stain", "Values 2" : "0.19397 0.8671 0.45883", "Background" : " 214 222 196"}');
+// run the above for all images including in the training project
+
+// run below on the actual project. not on the pixel classifier training project
+// createAnnotationsFromPixelClassifier("tissue_threshold", 50000.0, 5.0, "SPLIT", "INCLUDE_IGNORED")
+
+createAnnotationsFromPixelClassifier("tissue_threshold", 50000.0, 5.0, "SPLIT")
+
+
+// now we do the pixel classification only on the detected tissue
+selectAnnotations();
+createAnnotationsFromPixelClassifier("collagen_adipose_bkgrd_cm_2025_05_28", 0, 0, "SELECT_NEW")
+addPixelClassifierMeasurements("collagen_adipose_bkgrd_cm_2025_05_28", "collagen_adipose_bkgrd_cm_2025_05_28")
+
+
+// Get all Tissue annotations
+// Define the classes you want to measure
+def classesToMeasure = ["Collagen", "cardiomyocyte", "adipose", "background"]
+
+
+def tissueAnnotations = getAnnotationObjects().findAll { it.getPathClass() == getPathClass("Tissue") }
+
+def server = getCurrentImageData().getServer()
+def pxWidth = server.getPixelCalibration().getPixelWidth()
+def pxHeight = server.getPixelCalibration().getPixelHeight()
+
+
+tissueAnnotations.each { tissue ->
+    def tissueArea = tissue.getROI().getScaledArea(pxWidth, pxHeight)
+
+    // Get children (should be pixel classifier-derived annotations)
+    def children = tissue.getChildObjects()
+
+    // For each class, compute area and percent
+    classesToMeasure.each { className ->
+        def classObjs = children.findAll { it.getPathClass() == getPathClass(className) }
+        def classArea = classObjs.collect {
+            it.getROI().getScaledArea(pxWidth, pxHeight)
+        }.sum() ?: 0.0
+
+        def percent = (tissueArea > 0) ? 100.0 * classArea / tissueArea : 0.0
+
+        // Add measurements to parent Tissue annotation
+        tissue.getMeasurementList().putMeasurement("Area µm^2 " + className, classArea)
+        tissue.getMeasurementList().putMeasurement("% " + className, percent)
+    }
+
+    // Also add total tissue area for reference
+    tissue.getMeasurementList().putMeasurement("Total Tissue Area µm^2", tissueArea)
+}
+
+print "✅ Done calculating area and percent for each class per Tissue annotation."
+
+// select run for project
