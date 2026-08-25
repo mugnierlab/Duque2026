@@ -1,0 +1,70 @@
+#!/bin/bash
+
+Cardio_folder="/path/to/input"
+trust4_folder="/path/to/trust4"
+
+
+
+#get the --ref file for Humans
+perl ~/.conda/envs/cdRNAseq3.8/bin/BuildImgtAnnot.pl Homo_sapien > ${trust4_files}/human38_109_IMGT+C.fa
+
+
+#bulk RNAseq
+
+for path in ${Cardio_folder}/FASTQ/*fastq.gz; do
+        SAMPLEID="$(basename "${path}")"
+        if [[ "$(basename "${path}")" == *"R1_001"* ]]
+        then
+            	SAMPLEID=${SAMPLEID::-16}
+        else
+            	continue
+        fi
+echo $SAMPLEID
+
+~/.conda/envs/cdRNAseq3.8/bin/run-trust4 \
+-f ${trust4_folder}/human38_109_IMGT+C.fa \
+--ref ${trust4_folder}/human38_109_IMGT+C.fa \
+-t 10 \
+-1 ${Cardio_folder}/FASTQ/${SAMPLEID}_R1_001.fastq.gz \
+-2 ${Cardio_folder}/FASTQ/${SAMPLEID}_R2_001.fastq.gz \
+-o ${Cardio_folder}/trust4/${SAMPLEID}
+
+done
+
+
+# scRNAseq
+
+genome_files="/path/to/Human38/release109"
+
+
+#make reference file compatible with bam
+grep ">" ${trust4_files}/human38_109_IMGT+C.fa | cut -f2 -d'>' | cut -f1 -d'*' | sort | uniq > ${trust4_files}/human38_109_bcr_tcr_gene_name.txt
+
+#i was getting errors with the gtf files that didn't have transcript ids.
+grep 'transcript_name' ${genome_files}/gtf/Homo_sapiens.GRCh38.109.gtf > ${genome_files}/gtf/Homo_sapiens.GRCh38.109transcript_filtered.gtf
+
+
+cd ${trust4_folder}
+wget https://github.com/liulab-dfci/TRUST4/raw/master/hg38_bcrtcr.fa
+
+
+singlecell_Folder="/path/to/single_cell_folder"
+
+
+for folder in ${singlecell_Folder}/copy_cell_ranger_counts/*; do
+
+    Pool_ID="$(basename "${folder}")"
+    mkdir -p "${singlecell_Folder}/trust4/${Pool_ID}"
+
+    echo "analyzing: ${Pool_ID}"
+
+~/.conda/envs/cdRNAseq3.8/bin/run-trust4 \
+-f ${trust4_files}/hg38_bcrtcr.fa \
+--ref ${trust4_files}/human38_109_IMGT+C.fa \
+-t 16 \
+-b ${singlecell_Folder}/copy_cell_ranger_counts/${Pool_ID}/${Pool_ID}_outs/${Pool_ID}_possorted_genome_bam.bam \
+--barcode CB \
+--od "${singlecell_Folder}/trust4/${Pool_ID}" \
+-o "${Pool_ID}"
+
+done
