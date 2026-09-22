@@ -68,8 +68,8 @@ for (cell_type in cell_types) {
   
   set.seed(12345)
   # Fit the linear mixed model
-  # models with Media alone (not SeqBatch alone or SeqBatch + Media) performed best by AIC
-  model <- try(lm(Abundance ~ Group2 * Sex + Media, data = subset_data), silent = TRUE)
+  # models with Media alone or SeqBatch + Media performed best by AIC overall, with both performing slightly better (compared to just Group2*Sex or Group2*Sex + SeqBatch)
+  model <- try(lm(Abundance ~ Group2 * Sex + SeqBatch + Media, data = subset_data), silent = TRUE)
   
   # Check if the model fit was successful
   if (inherits(model, "try-error")) {
