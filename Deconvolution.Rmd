@@ -1,0 +1,642 @@
+---
+title: "Cardio deconv males and females"
+author: "Carolina"
+format: html
+editor: visual
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Set up
+
+```{r packages, message=FALSE, results='hide'}
+library(readxl)
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+#library(ggpattern)
+library(ggpubr)
+library(tibble)
+library(lme4)
+library(lmerTest)  # for p-values
+library(dplyr)
+library(emmeans)
+
+library(immunedeconv)
+
+phenocols_sex <- c(M_AA="#f8fa89",
+                M_AB1.B2="#f0c405",
+                M_B1B1 = "#ffa45e",
+                M_B1B2.C.D="#ed5b37",
+                F_AA="#f5b5d6",
+                F_AB1.B2 ="#e3599e",
+                F_B1B1 = "#e174e3",
+                F_B1B2.C.D="#8b2eb3")
+
+
+library(colorspace)
+
+phenocols_sex_dark <- darken(phenocols_sex, amount = 0.3)
+
+```
+
+functions
+
+```{r}
+
+prog_lm <- function(df){
+# Initialize an empty list to store results
+results_list <- list()
+model_list <- list()
+
+# Get unique CellTypes
+cell_types <- unique(df$CellType)
+
+# Loop through each CellType
+for (cell_type in cell_types) {
+  
+  # Subset the data for the current CellType
+  subset_data <- subset(df, CellType == cell_type)
+  
+  set.seed(12345)
+  # Fit the linear mixed model
+  # models with Media alone (not SeqBatch alone or SeqBatch + Media) performed best by AIC
+  model <- try(lm(Abundance ~ Group2 * Sex + Media, data = subset_data), silent = TRUE)
+  
+  # Check if the model fit was successful
+  if (inherits(model, "try-error")) {
+    warning("Model failed to converge for CellType: ", cell_type, " ")
+    next  # Skip this iteration if the model didn't converge
+  }
+  
+  model_list[[cell_type]] <- model
+
+  
+  ## Estimated marginal means: Group comparisons WITHIN sex
+  set.seed(12345)
+  emm <- emmeans(model, ~ Group2 | Sex)
+  
+  contrasts <- contrast(
+      emm,
+      method = "pairwise",
+      adjust = "none"   # IMPORTANT: we do FDR ourselves
+    )
+
+    contrast_df <- as.data.frame(contrasts)
+
+    contrast_df$CellType <- cell_type
+
+    results_list[[cell_type]] <- contrast_df
+}
+
+# Combine all results into a single data frame
+results_prog <- do.call(rbind, results_list)
+
+# FDR correction for the Group2 effect
+
+  results_prog <- results_prog %>%
+    group_by(Sex) %>%
+    mutate(FDR = p.adjust(p.value, method = "fdr")) %>%
+    ungroup()
+
+
+results_prog  = results_prog %>% mutate(
+  psymbol = case_when( p.value < 0.001 ~ "***",
+                       p.value >= 0.001 & p.value < 0.01 ~ "**",
+                       p.value >= 0.01 & p.value < 0.05 ~ "*",
+                       p.value > 0.05 ~ "NS"),
+  FDRsymbol = case_when( FDR < 0.001 ~ "***",
+                       FDR >= 0.001 & FDR < 0.01 ~ "**",
+                       FDR >= 0.01 & FDR < 0.05 ~ "*",
+                       FDR > 0.05 ~ "NS")
+  
+)
+
+return(list(
+    results = results_prog,
+    models = model_list
+  ))
+}
+
+```
+
+```{r}
+
+Cardiocondition=read_excel("~/CardioCondition.xlsx")
+
+
+Cardioinfo=Cardiocondition
+
+Cardioinfo$SeqOrder <- as.numeric(Cardioinfo$SeqOrder)
+Cardioinfo = Cardioinfo %>% arrange(SeqOrder)
+
+
+Cardioinfo<- Cardioinfo %>%
+  mutate(across(where(is.character), ~na_if(trimws(.), "")),
+         across(where(is.character), ~na_if(., "NA")), 
+         across(where(is.character), ~na_if(., "Inf")),
+         across(where(is.numeric), ~ ifelse(is.infinite(.), NA, .)),
+         across(where(is.numeric), ~ifelse(. == "", NA, as.numeric(.))))
+
+Cardioinfo<- Cardioinfo %>% mutate(
+  Group2_sex = case_when(Group == "AA" ~ paste(Sex,"AA", sep = "_"),
+                         Group == "B1B1" ~ paste(Sex,"B1B1", sep = "_"),
+                    Group == "AB1" ~ paste(Sex,"AB1.B2", sep = "_"),
+                    Group == "AB2" ~ paste(Sex,"AB1.B2", sep = "_"),
+                    #Group == "AC.D" ~ "AB1.B2",
+                    Group == "B1B2" ~ paste(Sex,"B1B2.C.D", sep = "_"),
+                    Group == "B1C.D" ~ paste(Sex,"B1B2.C.D", sep = "_"),
+                    TRUE ~ Group),
+  Group2 = case_when(Group == "AB1" ~ "AB1.B2",
+                    Group == "AB2" ~ "AB1.B2",
+                    #Group == "AC.D" ~ "AB1.B2",
+                    Group == "B1B2" ~ "B1B2.C.D",
+                    Group == "B1C.D" ~ "B1B2.C.D",
+                    TRUE ~ Group))
+
+info <- Cardioinfo %>%
+   select(Code, Patient, Category, Group2, Group2_sex, Time, Infected,Sex, Media, SeqBatch)
+
+sequenced_sample_data = subset(Cardioinfo, !is.na(SeqOrder))
+```
+
+```{r}
+library("immunedeconv")   
+TPMcounts=read.delim("~/Deconv/Cardio_TPM_batch1234.txt",row.names = 1)
+
+
+
+design_keep = model.matrix(~ Group2_sex, data = sequenced_sample_data)
+
+library(limma)
+
+corrected_TPM <- removeBatchEffect(
+  log2(TPMcounts + 1),
+  batch = sequenced_sample_data$SeqBatch,       # Primary batch effect
+  batch2 = sequenced_sample_data$Media,             # Secondary batch effect
+  design = design_keep            # Protect biological variables
+)
+
+
+corrected_TPM <- 2^corrected_TPM -1
+
+corrected_TPM <- round(corrected_TPM, 6)
+corrected_TPM[corrected_TPM < 0] <- 0 #cibersort does this internally anyway so ill do it for xcell and ABIS
+
+
+
+#write.table(corrected_TPM, "~/Cardio_TPM_BatchCorrected.txt",sep = "\t")
+```
+
+aligning celltypes. see cibersort_xcell_abis_celltypes for how to merge some cell types and remove others
+
+```{r}
+cells_cibersort <- c("B.cells.naive", "B.cells.memory", "Plasma.cells", "T.cells.CD8", 
+"T.cells.CD4.naive", "T.cells.CD4.memory.resting", "T.cells.CD4.memory.activated", 
+"T.cells.follicular.helper", "T.cells.regulatory..Tregs.", "T.cells.gamma.delta", 
+"NK.cells.resting", "NK.cells.activated", "Monocytes", "Macrophages.M0", 
+"Macrophages.M1", "Macrophages.M2", "Dendritic.cells.resting", 
+"Dendritic.cells.activated", "Mast.cells.resting", "Mast.cells.activated", 
+"Eosinophils", "Neutrophils")
+
+cells_xcell <-c("Myeloid dendritic cell activated", "B cell", "T cell CD4+ memory", 
+"T cell CD4+ naive", "T cell CD4+ (non-regulatory)", "T cell CD4+ central memory", 
+"T cell CD4+ effector memory", "T cell CD8+ naive", "T cell CD8+", 
+"T cell CD8+ central memory", "T cell CD8+ effector memory", 
+"Class-switched memory B cell", "Myeloid dendritic cell", 
+"Eosinophil", "Mast cell", "B cell memory", "Monocyte", "B cell naive", 
+"Neutrophil", "NK cell", "T cell NK", "Plasmacytoid dendritic cell", 
+"B cell plasma", "T cell gamma delta", "T cell CD4+ Th1", "T cell CD4+ Th2", 
+"T cell regulatory (Tregs)")
+
+cells_abis <-c("Monocyte conventional", "NK cell", "T cell CD8+ memory", "T cell CD4+ naive", 
+"T cell CD8+ naive", "B cell naive", "T cell CD4+ memory", "T cell MAIT", 
+"T cell gamma delta VD2", "Neutrophil", "T cell gamma delta non-VD2", 
+"Basophil", "Monocyte non-conventional", "B cell memory", "Myeloid dendritic cell", 
+"Plasmacytoid dendritic cell", "B cell plasma immature")
+
+
+```
+
+# CIBERSORT
+
+I run cibersortx on <https://cibersortx.stanford.edu/>. I use the LM22 microarray signature matrix. Since my data is from bulk RNAseq, I perform batch correction in B mode using LM22 source GEP file to account for the difference in microarray and RNAseqd data. I run 1000 permutations
+
+```{r, echo=FALSE}
+ciber_Abundance_wide_corrected=read.csv("~/Deconv/CIBERSORTx_batch1234_absolute_corrected.csv") #this was using the batch corrected TPMs
+
+ciber_Abundance_wide=read.csv("~/Deconv/CIBERSORTx_batch1234_absolute.csv") #this is using the non-limma-batch corrected TPMS
+
+ciber_Abundance_wide <- subset(ciber_Abundance_wide, select = -c(RMSE, Correlation, P.value,Absolute.score..sig.score.))
+
+ciber_Abundance_wide_corrected <- subset(ciber_Abundance_wide_corrected, select = -c(RMSE, Correlation, P.value,Absolute.score..sig.score.))
+
+
+#group some cells to make them more comparable to ABIS and xcell
+ciber_Abundance_wide <- ciber_Abundance_wide %>%
+  mutate(
+    Tcells.CD4.memory = T.cells.CD4.memory.resting + T.cells.CD4.memory.activated,
+    NKcells = NK.cells.resting + NK.cells.activated,
+    Dendritic.cells = Dendritic.cells.resting + Dendritic.cells.activated,
+    Mast.cells = Mast.cells.resting + Mast.cells.activated
+  ) %>%
+  select(
+    -T.cells.CD4.memory.resting, -T.cells.CD4.memory.activated,
+    -NK.cells.resting, -NK.cells.activated,
+    -Dendritic.cells.resting, -Dendritic.cells.activated,
+    -Mast.cells.resting, -Mast.cells.activated,-Macrophages.M0, -Macrophages.M1,  -Macrophages.M2, -T.cells.follicular.helper
+  )
+
+
+ciber_Abundance_wide_corrected <- ciber_Abundance_wide_corrected %>%
+  mutate(
+    Tcells.CD4.memory = T.cells.CD4.memory.resting + T.cells.CD4.memory.activated,
+    NKcells = NK.cells.resting + NK.cells.activated,
+    Dendritic.cells = Dendritic.cells.resting + Dendritic.cells.activated,
+    Mast.cells = Mast.cells.resting + Mast.cells.activated
+  ) %>%
+  select(
+    -T.cells.CD4.memory.resting, -T.cells.CD4.memory.activated,
+    -NK.cells.resting, -NK.cells.activated,
+    -Dendritic.cells.resting, -Dendritic.cells.activated,
+    -Mast.cells.resting, -Mast.cells.activated,-Macrophages.M0, -Macrophages.M1,  -Macrophages.M2, -T.cells.follicular.helper
+  )
+
+
+cell_types = colnames(ciber_Abundance_wide)[2:ncol(ciber_Abundance_wide)]
+
+ciber_Abundance_wide <- ciber_Abundance_wide %>% 
+  rename(Code = Mixture ) %>% 
+   left_join(info, by="Code")
+
+ciber_Abundance_wide_corrected <- ciber_Abundance_wide_corrected %>% 
+  rename(Code = Mixture ) %>% 
+   left_join(info, by="Code")
+
+ciber_Abundance_wide=na.omit(ciber_Abundance_wide)
+
+ciber_Abundance_wide_corrected=na.omit(ciber_Abundance_wide_corrected)
+
+
+info_length = ncol(info)-1
+ciber_cols = ncol(ciber_Abundance_wide)
+
+ciber_Abundance_wide[(ciber_cols-info_length+1):ciber_cols] <- lapply(ciber_Abundance_wide[(ciber_cols-info_length+1):ciber_cols], as.factor)
+
+ciber_Abundance_wide_corrected[(ciber_cols-info_length+1):ciber_cols] <- lapply(ciber_Abundance_wide_corrected[(ciber_cols-info_length+1):ciber_cols], as.factor)
+
+
+ciber_Abundance_long = ciber_Abundance_wide %>%
+  pivot_longer(!c(Code, Patient, Category, Group2, Group2_sex, Time, Infected,Sex, Media, SeqBatch), names_to = "CellType", values_to = "Abundance")
+
+
+
+ciber_Abundance_long_corrected = ciber_Abundance_wide_corrected %>%
+  pivot_longer(!c(Code, Patient, Category, Group2,Group2_sex, Time, Infected,Sex, Media, SeqBatch), names_to = "CellType", values_to = "Abundance")
+
+
+
+
+#progression
+
+
+tciber_long_prog_all= subset(ciber_Abundance_long, Infected=="Pos" & Time=="1" &(Group2 %in% c("AA","AB1.B2","B1B1","B1B2.C.D")))
+
+ciber_long_prog_all_corrected= subset(ciber_Abundance_long_corrected, Infected=="Pos" & Time=="1" &(Group2 %in% c("AA","AB1.B2","B1B1","B1B2.C.D")))
+
+
+
+
+```
+
+## Progressors vs non progressors
+
+linear model adjusting for sequencing batch and media  
+
+Absoluate values allow for comparison of a given cell type across patients (Inter group comparison), but suposedly this can also be used to compare between cell types.
+
+```{r}
+ciber_test_prog_all <- prog_lm(tciber_long_prog_all)
+
+
+ciber_sig_prog_all  = subset(ciber_test_prog_all$results , p.value < 0.05)
+knitr::kable(ciber_sig_prog_all)
+```
+
+ 
+
+```{r}
+
+facet_max <- tciber_long_prog_all%>%
+  group_by(CellType, Sex) %>%
+  summarise(max_prop = max(Abundance, na.rm = TRUE), .groups = "drop")
+
+ciber_sig_prog_all <- ciber_sig_prog_all %>%
+  filter(FDR <0.05)%>%
+  tidyr::separate_wider_delim(contrast, delim = " - ", names = c("group1", "group2"), cols_remove = FALSE) %>%
+  mutate(group1 = paste(Sex, group1, sep = "_"),
+         group2 = paste(Sex, group2, sep = "_"),
+         FDR.round = round(FDR,3),
+         FDR = case_when(FDR < 0.001 ~ "<0.001",
+                         TRUE ~ as.character(FDR.round)))%>%
+left_join(facet_max, by = c("CellType","Sex")) %>%
+group_by(CellType,Sex) %>%
+ mutate(
+    y.position = {
+      mp <- unique(max_prop)   # ensure it's length 1
+      seq(mp * 1.05, mp * 1.2, length.out = n())
+    }
+  ) %>%
+  ungroup()
+
+```
+
+ 
+
+```{r, fig.height=8.2, fig.width = 15.5}
+
+
+
+
+ggplot(ciber_long_prog_all_corrected, aes(fill=Group2_sex,x=Group2_sex, y=Abundance)) +
+  geom_jitter(width = 0.2, height = 0, size = 1, alpha = 0.8, aes(color = Group2_sex)) +
+  geom_boxplot(position="dodge", width=0.75, outlier.size = 0, alpha = 0.6)+
+  scale_color_manual(values=phenocols_sex_dark )+
+  scale_fill_manual(values=phenocols_sex )+
+ theme_classic()+
+    facet_wrap(~CellType, scales="free_y")+
+   scale_y_continuous(expand = expansion(mult = c(0, 0.1)))+
+  stat_pvalue_manual(ciber_sig_prog_all, label = "FDR", size =2) +
+  theme(strip.text = element_text(face = "bold", size =7),
+    axis.text.x = element_text(angle = 45, hjust = 1, size =6, color="black"),
+    axis.text.y = element_text(size =6, color="black"),
+    axis.title.y = element_text(size =7, color="black"),
+    axis.title.x = element_text(size =0, color="black"),
+    legend.text = element_text(size = 5.5),
+    legend.title = element_text(size = 6),
+    legend.key.size = unit(11, "pt"))
+
+
+ ggsave(filename="~/Deconv/cibersort_all.pdf",width = 13, height=8.2) 
+
+```
+ 
+
+# X cell
+
+array = false when RNAseq
+
+expected cell types is good to define, so i removed ("Common lymphoid progenitor", "Common myeloid progenitor","Cancer associated fibroblast", "Granulocyte-monocyte progenitor", "Hematopoietic stem cell", "Macrophage", "Macrophage M1", "Macrophage M2") since these should not be in the peripheral blood
+
+i think im also going to remove the following cell types to better align with cibersort and abis - b cell, class-switched memory B cell, - "T cell CD8+ effector memory", "T cell CD8+ central memory", "T cell CD8+ naive", - "T cell CD4+ (non-regulatory)", "T cell CD4+ central memory", "T cell CD4+ effector memory","T cell CD4+ Th1", "T cell CD4+ Th2", -"Myeloid dendritic cell activated",
+
+```{r}
+set.seed(12345)
+xcelltypes <- c( "T cell CD4+ memory", 
+"T cell CD4+ naive", "T cell CD8+", "Myeloid dendritic cell",  
+"Eosinophil", "Mast cell", "B cell memory", "Monocyte", "B cell naive", "Neutrophil", 
+"NK cell",  "Plasmacytoid dendritic cell", "B cell plasma", 
+"T cell gamma delta",  "T cell regulatory (Tregs)")
+#"T cell NK"
+
+xcell=immunedeconv::deconvolute(TPMcounts, "xcell", arrays = FALSE, expected_cell_types = xcelltypes)
+
+txcell<-as.data.frame(t(xcell[-1]))
+colnames(txcell) <- xcell$cell_type
+
+txcell <- txcell %>% 
+   rownames_to_column("Code") %>% 
+   left_join(info, by="Code")
+
+txcell=na.omit(txcell)
+txcell_long = txcell %>%
+  pivot_longer(!c(Code, Patient, Category, Group2, Group2_sex, Time, Infected, Sex, Media, SeqBatch), names_to = "CellType", values_to = "Abundance")
+
+
+
+
+xcell_corrected=immunedeconv::deconvolute(corrected_TPM, "xcell", arrays = FALSE, expected_cell_types = xcelltypes)
+
+txcell_corrected<-as.data.frame(t(xcell_corrected[-1]))
+colnames(txcell_corrected) <- xcell_corrected$cell_type
+
+txcell_corrected <- txcell_corrected %>% 
+   rownames_to_column("Code") %>% 
+   left_join(info, by="Code")
+
+txcell_corrected=na.omit(txcell_corrected)
+txcell_corrected_long = txcell_corrected %>%
+  pivot_longer(!c(Code, Patient, Category, Group2,Group2_sex,  Time, Infected, Sex, Media, SeqBatch), names_to = "CellType", values_to = "Abundance")
+```
+
+## Progressors vs non progressors
+
+
+```{r}
+txcell_long_prog_all <- subset(txcell_long, Infected=="Pos" & Time=="1" & (Group2 %in% c("AA","AB1.B2","B1B1","B1B2.C.D")))
+
+txcell_long_prog_all_corrected <- subset(txcell_corrected_long, Infected=="Pos" & Time=="1" & (Group2 %in% c("AA","AB1.B2","B1B1","B1B2.C.D")))
+
+
+
+xcell_test_prog_all <- prog_lm(txcell_long_prog_all)
+
+
+xcell_sig_prog_all  = subset(xcell_test_prog_all$results , p.value < 0.05)
+knitr::kable(xcell_sig_prog_all)
+```
+
+```{r}
+
+facet_max <- txcell_long_prog_all%>%
+  group_by(CellType, Sex) %>%
+  summarise(max_prop = max(Abundance, na.rm = TRUE), .groups = "drop")
+
+xcell_sig_prog_all <- xcell_sig_prog_all %>%
+  filter(FDR <0.05)%>%
+  tidyr::separate_wider_delim(contrast, delim = " - ", names = c("group1", "group2"), cols_remove = FALSE) %>%
+  mutate(group1 = paste(Sex, group1, sep = "_"),
+         group2 = paste(Sex, group2, sep = "_"),
+         FDR.round = round(FDR,3),
+         FDR = case_when(FDR < 0.001 ~ "<0.001",
+                         TRUE ~ as.character(FDR.round)))%>%
+left_join(facet_max, by = c("CellType","Sex")) %>%
+group_by(CellType,Sex) %>%
+ mutate(
+    y.position = {
+      mp <- unique(max_prop)   # ensure it's length 1
+      seq(mp * 1.05, mp * 1.2, length.out = n())
+    }
+  ) %>%
+  ungroup()
+
+```
+
+```{r, fig.height=8.2, fig.width = 15.5}
+
+ggplot(txcell_long_prog_all_corrected, aes(fill=Group2_sex,x=Group2_sex, y=Abundance)) +
+  geom_jitter(width = 0.2, height = 0, size = 1, alpha = 0.8, aes(color = Group2_sex)) +
+  geom_boxplot(position="dodge", width=0.7, outlier.size = 0, alpha = 0.6)+
+  scale_color_manual(values=phenocols_sex_dark )+
+  scale_fill_manual(values=phenocols_sex )+
+ theme_classic()+
+    facet_wrap(~CellType, scales="free_y")+
+   scale_y_continuous(expand = expansion(mult = c(0, 0.1)))+
+  stat_pvalue_manual(xcell_sig_prog_all, label = "FDR", size =2) +
+  theme(strip.text = element_text(face = "bold", size =7),
+    axis.text.x = element_text(angle = 45, hjust = 1, size =6, color="black"),
+    axis.text.y = element_text(size =6, color="black"),
+    axis.title.y = element_text(size =7, color="black"),
+    axis.title.x = element_text(size =0, color="black"),
+    legend.text = element_text(size = 5.5),
+    legend.title = element_text(size = 6),
+    legend.key.size = unit(11, "pt"))
+
+
+
+ ggsave(filename="~/Deconv/xcell_all.pdf",width = 14, height=8.2) 
+
+```
+
+# ABIS
+
+```{r}
+abis=immunedeconv::deconvolute(TPMcounts, "abis", arrays = FALSE) # arrays = false since RNAseq
+abis_corrected=immunedeconv::deconvolute(corrected_TPM, "abis", arrays = FALSE) # arrays = false since RNAseq
+
+
+tabis<-as.data.frame(t(abis[-1]))
+tabis_corrected<-as.data.frame(t(abis_corrected[-1]))
+
+colnames(tabis) <- abis$cell_type
+colnames(tabis_corrected) <- abis_corrected$cell_type
+
+
+tabis <- tabis %>% 
+   rownames_to_column("Code") %>% 
+   left_join(info, by="Code")
+
+tabis_corrected <- tabis_corrected %>% 
+   rownames_to_column("Code") %>% 
+   left_join(info, by="Code")
+
+tabis=na.omit(tabis)
+
+
+tabis_corrected=na.omit(tabis_corrected)
+
+
+tabis_corrected <- tabis_corrected %>%
+  mutate(
+    Tcells.CD8 = `T cell CD8+ memory` + `T cell CD8+ naive`,
+    Tcell.gamma.delta = `T cell gamma delta VD2` + `T cell gamma delta non-VD2`,
+    Monocytes = `Monocyte non-conventional` + `Monocyte conventional`
+  ) %>%
+  select(
+    -`T cell CD8+ memory`,-`T cell CD8+ naive`,
+    -`T cell gamma delta VD2` ,-`T cell gamma delta non-VD2`,
+   -`Monocyte non-conventional` ,-`Monocyte conventional`, -`T cell MAIT`
+    
+  )
+
+
+
+tabis<- tabis %>%
+  mutate(
+    Tcells.CD8 = `T cell CD8+ memory` + `T cell CD8+ naive`,
+    Tcell.gamma.delta = `T cell gamma delta VD2` + `T cell gamma delta non-VD2`,
+    Monocytes = `Monocyte non-conventional` + `Monocyte conventional`
+  ) %>%
+  select(
+    -`T cell CD8+ memory`,-`T cell CD8+ naive`,
+    -`T cell gamma delta VD2` ,-`T cell gamma delta non-VD2`,
+   -`Monocyte non-conventional` ,-`Monocyte conventional`, -`T cell MAIT`
+    
+  )
+
+
+tabis_long = tabis %>%
+  pivot_longer(!c(Code, Patient, Category, Group2, Group2_sex, Time, Infected, Sex, Media, SeqBatch), names_to = "CellType", values_to = "Abundance")
+
+
+tabis_long_corrected = tabis_corrected %>%
+  pivot_longer(!c(Code, Patient, Category, Group2, Group2_sex, Time, Infected, Sex, Media, SeqBatch), names_to = "CellType", values_to = "Abundance")
+```
+
+
+## Progressors vs non progressors 
+
+```{r}
+tabis_long_prog_all <- subset(tabis_long, Infected=="Pos" & Time=="1" & (Group2 %in% c("AA","AB1.B2","B1B1","B1B2.C.D")))
+
+tabis_long_prog_all_corrected <- subset(tabis_long_corrected, Infected=="Pos" & Time=="1" & (Group2 %in% c("AA","AB1.B2","B1B1","B1B2.C.D")))
+
+
+
+
+abis_test_prog_all <- prog_lm(tabis_long_prog_all)
+
+
+abis_sig_prog_all  = subset(abis_test_prog_all$results , p.value < 0.05)
+knitr::kable(abis_sig_prog_all)
+```
+
+```{r}
+facet_max <- tabis_long_prog_all%>%
+  group_by(CellType, Sex) %>%
+  summarise(max_prop = max(Abundance, na.rm = TRUE), .groups = "drop")
+
+abis_sig_prog_all <- abis_sig_prog_all %>%
+  filter(FDR <0.05)%>%
+  tidyr::separate_wider_delim(contrast, delim = " - ", names = c("group1", "group2"), cols_remove = FALSE) %>%
+  mutate(group1 = paste(Sex, group1, sep = "_"),
+         group2 = paste(Sex, group2, sep = "_"),
+         FDR.round = round(FDR,3),
+         FDR = case_when(FDR < 0.001 ~ "<0.001",
+                         TRUE ~ as.character(FDR.round)))%>%
+left_join(facet_max, by = c("CellType","Sex")) %>%
+group_by(CellType,Sex) %>%
+ mutate(
+    y.position = {
+      mp <- unique(max_prop)   # ensure it's length 1
+      seq(mp * 1.05, mp * 1.2, length.out = n())
+    }
+  ) %>%
+  ungroup()
+
+```
+
+```{r, fig.height=8, fig.width = 13}
+
+
+ggplot(tabis_long_prog_all_corrected, aes(fill=Group2_sex,x=Group2_sex, y=Abundance)) +
+  geom_jitter(width = 0.2, height = 0, size = 1, alpha = 0.8, aes(color = Group2_sex)) +
+  geom_boxplot(position="dodge", width=0.7, outlier.size = 0, alpha = 0.6)+
+  scale_color_manual(values=phenocols_sex_dark )+
+  scale_fill_manual(values=phenocols_sex )+
+  facet_wrap(~CellType, scales="free_y")+
+ theme_classic()+
+   scale_y_continuous(expand = expansion(mult = c(0, 0.1)))+
+  stat_pvalue_manual(abis_sig_prog_all, label = "FDR", size =2) +
+  theme(strip.text = element_text(face = "bold", size =7),
+    axis.text.x = element_text(angle = 45, hjust = 1, size =6, color="black"),
+    axis.text.y = element_text(size =6, color="black"),
+    axis.title.y = element_text(size =7, color="black"),
+    axis.title.x = element_text(size =0, color="black"),
+    legend.text = element_text(size = 5.5),
+    legend.title = element_text(size = 6),
+    legend.key.size = unit(11, "pt"))
+
+
+ ggsave(filename="~/Deconv/abis_all.pdf",width = 12.54, height=7.1) 
+
+```
+
