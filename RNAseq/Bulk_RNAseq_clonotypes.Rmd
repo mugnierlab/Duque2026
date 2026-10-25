@@ -1,0 +1,2258 @@
+---
+title: "Cardio_immunarch_RNAseq"
+author: "Carolina"
+format: html
+editor: visual
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+---
+
+
+# fix and filter files
+
+the trust4 output has counts under consensus_counts but immunearch needs it to be under duplicate_counts so i just rename. I also filter out any non-productive sequences
+
+```{r, eval=FALSE}
+# Set your folder path
+folder_path <- "Trust4/Airr_results"
+
+# List all files ending in _airr.tsv
+files <- list.files(path = folder_path, pattern = "_airr\\.tsv$", full.names = TRUE)
+
+# Loop through each file
+for (file in files) {
+  # Read the file
+  df <- read.delim(file, stringsAsFactors = FALSE)
+  
+  # Filter rows where productive == TRUE
+  if ("productive" %in% names(df)) {
+    df <- df[df$productive == T, ]
+  }
+  
+  # Rename the column if it exists
+  if ("consensus_count" %in% names(df)) {
+    names(df)[names(df) == "consensus_count"] <- "duplicate_count"
+  }
+  
+  # Overwrite the original file
+  write.table(df, file = file, sep = "\t", quote = FALSE, row.names = FALSE)
+}
+
+```
+
+# setup
+
+```{r}
+library(immunarch)
+library(tidyr)
+library(magrittr)
+library(dplyr)
+library(ggplot2)
+library(readr)
+library(stringr)
+library(ggpubr)
+library(purrr)
+library(pheatmap)
+library(tibble) 
+library(patchwork)
+library(iNEXT)
+library(viridisLite)
+library(glmmTMB)
+library(betareg)
+library(emmeans)
+library(colorspace)
+
+immdata <- repLoad("Trust4/Airr_results")
+
+
+phenocols_sex = c(F_AA_Pos="#f5b5c7",
+                  F_AB1.B2_Pos="#e3599e",
+                  F_B1B1_Pos =  "#e174e3", 
+                  F_B1B2.C.D_Pos="#8b2eb3", 
+                  
+                  M_AA_Pos="#f8fa89",
+                  M_AB1.B2_Pos="#f0c405",
+                  M_B1B1_Pos = "#ffa45e",
+                  M_B1B2.C.D_Pos="#ed5b37")
+
+
+
+
+
+phenocols_sex_dark <- darken(phenocols_sex, amount = 0.4)
+
+```
+
+they have a purr issue I need to fix for this version of R. Also this seemed to require using fixed_threshold so I adjusted that as well
+
+```{r}
+seqCluster <- function(.data, .dist, .perc_similarity, .nt_similarity, .fixed_threshold) {
+  if (!requireNamespace("igraph", quietly = TRUE)) {
+    stop("Package 'igraph' is required for this function. Please install it first via install.packages() or devtools::install_github().", call. = FALSE)
+  }
+
+  grouping_cols <- attr(.dist, "group_by")
+  matching_col <- attr(.dist, "col")
+  trimmed <- attr(.dist, "trimmed")
+  if (length(.data) != length(.dist)) {
+    stop(".data and .dist lengths do not match!")
+  }
+  if (all(!(names(.data) %in% names(.dist)))) {
+    stop(".data and .dist names do not match!")
+  } else {
+    .dist <- .dist[order(match(names(.dist), names(.data)))] # This one cause removing of all attributes except names!
+  }
+  if (!(matching_col %in% colnames(.data[[1]]))) {
+    stop("There is no ", matching_col, " in .data!")
+  }
+  thresh_cond <- c(missing(.perc_similarity), missing(.nt_similarity), missing(.fixed_threshold))
+  if (all(thresh_cond)) {
+    stop("Please, provide .perc_similarity, .nt_similarity or .fixed_threshold value")
+  }
+  if (sum(!thresh_cond) > 1) {
+    stop("Please, provide only one argument: .perc_similarity, .nt_similarity or .fixed_threshold value")
+  }
+
+
+  perc_similarity_fun <- function(x, t = .perc_similarity) {
+    x * (1 - t)
+  }
+
+
+  if (!missing(.perc_similarity)) {
+    .threshold_fun <- perc_similarity_fun
+  }
+
+  
+  graph_clustering <- function(dist_list, threshold_fun) {
+    seq_labels <- map(dist_list, ~ attr(.x, "Labels"))
+    singleseq_flag <- map_lgl(seq_labels, ~ length(.x) == 1)
+    seq_length <- map(seq_labels, ~ nchar(.x))
+    threshold <- map(seq_length, ~ .x %>% threshold_fun())
+    group_values <- map_dfr(dist_list, ~ attr(.x, "group_values"))
+    if (all(is.na(grouping_cols))) {
+      protocluster_names <- purrr::map_chr(seq_labels, 1)
+      result_single <- data.frame(
+        Sequence = unlist(seq_labels[singleseq_flag]),
+        Cluster = paste0(
+          protocluster_names[singleseq_flag],
+          "_length_",
+          seq_length[singleseq_flag],
+          "_cluster_1"
+        )
+      )
+    } else {
+      protocluster_names <- group_values %>%
+        unite(col = grouping_cols, sep = "/") %>%
+        pull(grouping_cols)
+      result_single <- data.frame(
+        Sequence = unlist(seq_labels[singleseq_flag]),
+        Cluster = paste0(
+          protocluster_names[singleseq_flag],
+          "_length_",
+          seq_length[singleseq_flag]
+        )
+      ) %>% cbind(group_values[singleseq_flag, ])
+    }
+    # ^if no grouping variables in data, sequences are IDs for clusters
+    multiseq_dist <- dist_list[!singleseq_flag]
+    mat_dist <- map2(multiseq_dist, threshold[!singleseq_flag], ~ as.matrix(.x) %>%
+      apply(., 1, function(x, t) {
+        ifelse(x > t, NA, x)
+      }, .y))
+    seq_clusters <- map(mat_dist, ~ reshape2::melt(.x, na.rm = TRUE) %>%
+      igraph::graph_from_data_frame() %>%
+      igraph::clusters() %>%
+      .$membership %>%
+      reshape2::melt() %>%
+      suppressWarnings())
+    result_multi <- seq_clusters %>%
+      map2(., seq_length[!singleseq_flag], ~ .x %>%
+        mutate(
+          length_value = map_chr(.y, ~ ifelse(all(.x == .x[1]),
+            yes = as.character(.x[1]),
+            no = glue("range_{min(.x)}:{max(.x)}")
+          ))
+        )) %>%
+      map2(., protocluster_names[!singleseq_flag], ~ rownames_to_column(.x, var = "Sequence") %>%
+        group_by(value, length_value) %>%
+        mutate(Cluster = paste0(.y, "_length_", length_value, "_cluster_", cur_group_id())) %>%
+        ungroup() %>%
+        select(Sequence, Cluster))
+    if (!all(is.na(grouping_cols))) {
+      result_multi %<>% map2_df(., pmap(group_values, data.frame)[!singleseq_flag], ~ cbind(.x, .y))
+      res <- rbind(result_single, result_multi)
+      res[grouping_cols] <- str_split(
+        str_split(res[["Cluster"]],
+          pattern = "_", simplify = TRUE
+        )[, 1],
+        pattern = "/", simplify = TRUE
+      )[, seq_along(grouping_cols)]
+    } else {
+      result_multi %<>% map_df(., ~.x)
+      res <- rbind(result_single, result_multi)
+      colnames(res) <- c(matching_col, "Cluster")
+    }
+    colnames(res)[1] <- matching_col
+    return(res)
+  }
+  clusters <- map(.dist, ~ graph_clustering(.x, threshold_fun = .threshold_fun))
+  if (!all(map2_lgl(clusters, .data, ~ nrow(.x) == nrow(.y)))) {
+    warning("Number of sequence provided in .data and .dist are not matching!")
+  }
+  # supress messages because join spams about joining by matching_col is done
+  temp_data <- .data
+  if (trimmed) {
+    for (colname in grouping_cols) {
+      temp_data <- add_column_with_first_gene(temp_data, colname)
+    }
+  }
+  joined_data <- map2(temp_data, clusters, ~ left_join(.x, .y) %>% suppressMessages())
+  clusters_cols <- map(joined_data, "Cluster")
+  result_data <- map2(.data, clusters_cols, ~ cbind(.x, "Cluster" = .y))
+  return(result_data)
+}
+
+
+add_column_with_first_gene <- function(.data, .original_colname, .target_colname = NA) {
+  .data %<>% apply_to_sample_or_list(.validate = FALSE, .function = function(df) {
+    if (validate_columns(df, .original_colname, .target_colname)) {
+      if (is.na(.target_colname)) {
+        .target_colname <- .original_colname
+      }
+      df[[.target_colname]] <- df[[.original_colname]] %>% sapply(function(genes_string) {
+        # first gene is substring until first ',', '(' or '*'
+        unlist(strsplit(genes_string, ",|\\(|\\*"))[1]
+      })
+    }
+    return(df)
+  })
+  return(.data)
+}
+
+apply_to_sample_or_list <- function(.data, .function, .with_names = FALSE, .validate = TRUE, ...) {
+  if (has_no_data(.data)) {
+    stop("Expected non-empty data; found: ", .data)
+  }
+  if (inherits(.data, "list")) {
+    if (.validate) {
+      .validate_repertoires_data(.data)
+    }
+    if (.with_names) {
+      .data %<>%
+        imap(function(sample_data, sample_name) {
+          sample_data %>%
+            as_tibble() %>%
+            .function(..., sample_name = sample_name)
+        })
+    } else {
+      .data %<>%
+        lapply(function(sample_data) {
+          sample_data %>%
+            as_tibble() %>%
+            .function(...)
+        })
+    }
+    return(.data)
+  } else {
+    .data %<>%
+      as_tibble() %>%
+      .function(...)
+    return(.data)
+  }
+}
+
+has_no_data <- function(.data) {
+  any(sapply(list(NA, NULL, NaN), identical, .data)) | all(is.na(.data))
+}
+
+validate_columns <- function(.data, .original_colname, .target_colname = NA) {
+  if (!(.original_colname %in% colnames(.data))) {
+    stop(
+      "Trying to get data from missing column ",
+      .original_colname,
+      ", available columns: ",
+      colnames(.data)
+    )
+  }
+  if (is.na(.target_colname)) {
+    # skip target check if target column is not specified
+    return(TRUE)
+  } else {
+    # FALSE return value means that the column was previously added and no need to add it again
+    return(!(.target_colname %in% colnames(.data)))
+  }
+}
+
+select <- dplyr::select
+```
+
+
+```{r setup, include=FALSE}
+library(ggplot2)
+
+theme_set(
+  theme_classic() +
+    theme(
+      strip.text = element_text(face = "bold", size = 6.5),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 5, color = "black"),
+      axis.text.y = element_text(size = 5, color = "black"),
+      axis.title.y = element_text(size = 6, color = "black"),
+      axis.title.x = element_text(size = 6, color = "black"),
+      title = element_text(size = 6.5, color = "black"),
+     legend.text = element_text(size = 5),
+    legend.title = element_text(size = 6),
+    legend.key.size = unit(9, "pt")
+    )
+)
+```
+
+
+```{r}
+immdata$meta <-  immdata$meta %>% mutate(
+  Group2 = case_when(Group == "AB1" ~ "AB1.B2",
+                    Group == "AB2" ~ "AB1.B2",
+                    Group == "B1B2" ~ "B1B2.C.D",
+                    Group == "B1C.D" ~ "B1B2.C.D",
+                    TRUE ~ Group))
+
+immdata$meta <- immdata$meta %>% mutate(
+  phenotype_sex = paste(immdata$meta$Sex,immdata$meta$Group2,immdata$meta$Infected,sep="_")
+)
+
+immdata$meta <- immdata$meta %>% mutate(
+  phenotype =  paste(immdata$meta$Group2,immdata$meta$Infected,sep="_")
+)
+
+
+immdata$meta$Sex <- factor(immdata$meta$Sex)
+```
+
+filter to just BCR and the groups of interest
+
+
+```{r}
+meta_data <- subset(immdata$meta, (Infected == "Pos" & Time == "1" & Group2  %in% c("AA","AB1.B2","B1B1","B1B2.C.D"))) 
+
+keep<-meta_data$Sample
+
+bcr_data <- lapply(immdata$data[keep], function(x) {
+  x %>%
+      filter(
+        grepl("^IGH", V.name) | 
+        grepl("^IGH", D.name) | 
+        grepl("^IGH", J.name)
+      ) %>%
+    mutate( 
+      J.name = case_when(is.na(J.name) ~ "NA",
+                         TRUE ~ J.name),
+      V.name = case_when(is.na(V.name) ~ "NA",
+                         TRUE ~ V.name),
+      Proportion = Clones / sum(Clones)
+    )
+})
+
+
+
+bcr_igdata <- list(data = bcr_data, meta = meta_data)
+
+bcr_igdata$meta$phenotype = factor(bcr_igdata$meta$phenotype, levels = c("AA_Pos","AB1.B2_Pos","B1B1_Pos",  "B1B2.C.D_Pos"))
+
+
+bcr_igdata$meta$phenotype_sex = factor(bcr_igdata$meta$phenotype_sex, levels = c("F_AA_Pos","F_AB1.B2_Pos","F_B1B1_Pos",  "F_B1B2.C.D_Pos","M_AA_Pos","M_AB1.B2_Pos","M_B1B1_Pos",  "M_B1B2.C.D_Pos"))
+
+
+
+```
+
+downsamples the repertoires to the number of clones (i.e., reads / UMIs) that the smallest repertoire has
+
+```{r}
+set.seed(1234)
+downsampled_bcr <- repSample(bcr_igdata$data, .method = "downsample")
+```
+
+
+"CDR3 region is the most variable region in BCR and TCR. This region is commonly used for calculating the distance between sequences. a similar CDR3 region could potentially arise from different VDJ rearrangement events. When running the analysis, group the clonotypes with similar CDR3 sequences by V gene, J gene, and/or sequence length to maximize the probability that similar CDR3 sequences arise from the same event (for BCRs)"
+
+"In mathematical terms, a clonotype is a vertex in graph. If two clonotypes have the same V and J genes and ‘CDR3.aa’. differs by less than a predefined threshold value, we draw an edge between the vertices. A cluster is a connected component — a set of clonotypes connected by edges."
+
+```{r}
+distBCR <- seqDist(bcr_igdata$data,.col = "CDR3.nt", .group_by = c('V.name', 'J.name'), .group_by_seqLength = T, .method = "hamming")
+
+
+# Now try running your clustering again
+clustBCR <- seqCluster(bcr_igdata$data, distBCR, .perc_similarity = 0.85)
+
+bcr_igdata$data <- clustBCR
+
+saveRDS(bcr_igdata,"~/bol_bulkRNAseq_long.rds")
+```
+
+now for the downsampled
+```{r}
+down_distBCR <- seqDist(downsampled_bcr,.col = "CDR3.nt", .group_by = c('V.name', 'J.name'), .group_by_seqLength = T, .method = "hamming")
+
+
+# Now try running your clustering again
+down_clustBCR <- seqCluster(downsampled_bcr, down_distBCR, .perc_similarity = 0.85)
+
+
+down_bcr_igdata <- list(data = down_clustBCR, meta = bcr_igdata$meta)
+```
+
+
+```{r}
+run_betaregression_simple <- function(df, celltype_col, design_formula) {
+
+  #ensure relevant variables are factors
+
+  df_colnames <- colnames(df)
+  df_colnames <- setdiff(df_colnames, c("proportion","total_reads","total_isotype_size"))
+
+  df[df_colnames]<- lapply(df[df_colnames],factor)
+
+  #make sure stage is an ordered factor
+  df$phenotype_sex = factor(df$phenotype_sex, 
+                       levels =c(
+       "F_AA_Pos" ,"F_AB1.B2_Pos","F_B1B1_Pos","F_B1B2.C.D_Pos",
+       "M_AA_Pos", "M_AB1.B2_Pos",  "M_B1B1_Pos", "M_B1B2.C.D_Pos"  ) 
+                    )
+  
+  df$phenotype = factor(df$phenotype, 
+                       levels =c(
+       "AA_Pos" ,"AB1.B2_Pos","B1B1_Pos","B1B2.C.D_Pos" ) 
+                    )
+  
+  df$Sex = factor(df$Sex, 
+                       levels =c(
+       "F" ,"M")
+                    )
+  
+
+  #pull out celltype names
+  unique_iso_types <- unique(df[[celltype_col]])
+
+
+  #create list to store model, predictions and coefficients
+  combined_list <- list()
+  model_list <- list()
+  coef_output <- list()
+  pred_output <- list()
+  emma_pairs <- list()
+  
+  for (iso_type in unique_iso_types) {
+
+    #subset datafram to this one cell type
+    subset_df <- subset(df, df[[celltype_col]] ==iso_type)
+
+
+    #transform data since can't have 0s or 1s
+    n <- nrow(subset_df)
+    subset_df$transformed_proportion <- (subset_df$proportion * (n - 1) + 0.5) / n
+    df[df[[celltype_col]] == iso_type, "transformed_proportion"] <- subset_df$transformed_proportion
+    
+    set.seed(12345)
+    #run beta regression
+    #model <- glmmTMB(as.formula(design_formula), family = beta_family(), data = subset_df)
+    model <- betareg(as.formula(design_formula), , data = subset_df)
+    
+    #add model to list
+    combined_list[[paste0(iso_type, "_model")]] <- model 
+    model_list[[paste0(iso_type, "_model")]] <- model 
+    
+    #extract and save coefficients to list
+    coef_table <- summary(model)$coefficients$mean
+    df_coef <- as.data.frame(coef_table)
+    df_coef$Coefficient <- rownames(coef_table)
+    rownames(df_coef) <- NULL
+    
+    df_coef <- df_coef %>% mutate(
+      p_symbol = case_when(
+        `Pr(>|z|)` < 0.001 ~ "***",
+        `Pr(>|z|)` < 0.01 ~ "**",
+        `Pr(>|z|)` < 0.05 ~ "*",
+        TRUE ~ "NS"
+      )
+    )
+    
+    df_coef$Iso_Type <- iso_type
+    
+    combined_list[[paste0(iso_type, "_coef")]] <- df_coef
+    
+    set.seed(12345)
+    emm <- emmeans(model, ~ phenotype | Sex)
+    pairwise <- contrast(emm, method = "pairwise", adjust = "BH")
+    pairwise_df <- as.data.frame(pairwise)
+    pairwise_df$Iso_Type <- iso_type
+    
+    combined_list[[paste0(iso_type, "_pairwise")]] <-pairwise_df
+
+    
+    formula_vars <- all.vars(as.formula(design_formula))[-1]  # Remove dependent variable
+    predictors <- subset_df[, formula_vars, drop = FALSE]  # Extract only predictor columns
+    
+    predictors_vars<-list()
+    # Ensure factors are properly set
+    for (col in colnames(predictors)) {
+        predictors_vars[[col]] <- unique(subset_df[[col]])  # Keep unique numeric values
+    }
+
+    new_data <- expand.grid(predictors_vars)
+    
+    # Generate predictions
+    new_data$predicted_proportion <- predict(model, newdata = new_data, type = "response")
+    new_data[[celltype_col]] <- iso_type
+    combined_list[[paste0(iso_type, "_predictions")]] <- new_data
+    
+    
+    
+  }
+
+  
+  coef_output <- do.call(rbind, lapply(combined_list[grepl("_coef", names(combined_list))], function(x) x))
+  pred_output <- do.call(rbind, lapply(combined_list[grepl("_predictions", names(combined_list))], function(x) x))
+  
+  pairwise_output <- do.call(rbind, lapply(combined_list[grepl("_pairwise", names(combined_list))], function(x) x))
+
+  #adjust prediction dataframe to match the ggplot naming we've been using previously (ie from numeric to characters)
+  pred_output <- pred_output %>%
+    group_by(.data[[celltype_col]]) %>%
+    mutate(n = n()) %>%
+    mutate(
+      predicted_proportion_original = ((predicted_proportion * n) - 0.5) / (n - 1), #transform back
+      predicted_percentage = predicted_proportion * 100,
+      predicted_percentage_og = predicted_proportion_original * 100
+    ) %>%
+  drop_na() 
+  
+  coef_output <- coef_output %>%
+  mutate(
+    FDR = p.adjust(`Pr(>|z|)`, method = "BH"),
+    FDR_symbol = case_when(
+        FDR < 0.001 ~ "***",
+        FDR < 0.01 ~ "**",
+        FDR < 0.05 ~ "*",
+        TRUE ~ "NS"
+      ))
+  
+  
+  pairwise_output <- pairwise_output %>%
+  mutate(
+    FDR = p.value,
+    FDR_symbol = case_when(
+        FDR < 0.001 ~ "***",
+        FDR < 0.01 ~ "**",
+        FDR < 0.05 ~ "*",
+        TRUE ~ "NS"
+      ))
+  
+  model_output <- combined_list
+  
+  
+  return(list(
+    updated_df = df,
+    coefficients = coef_output,
+    predictions = pred_output,
+    pairwise = pairwise_output,
+    models = model_list
+  ))
+}
+
+
+
+run_betaregression_mixed <- function(df, celltype_col, design_formula) {
+  
+  
+
+  #ensure relevant variables are factors
+
+  df_colnames <- colnames(df)
+  df_colnames <- setdiff(df_colnames, c("proportion","total_reads","total_isotype_size"))
+
+  df[df_colnames]<- lapply(df[df_colnames],factor)
+
+  #make sure stage is a factor
+  df$phenotype_sex = factor(df$phenotype_sex, 
+                       levels =c(
+       "F_AA_Pos" ,"F_AB1.B2_Pos","F_B1B1_Pos","F_B1B2.C.D_Pos",
+       "M_AA_Pos", "M_AB1.B2_Pos",  "M_B1B1_Pos", "M_B1B2.C.D_Pos"  ) 
+                    )
+  
+  df$phenotype = factor(df$phenotype, 
+                       levels =c(
+       "AA_Pos" ,"AB1.B2_Pos","B1B1_Pos","B1B2.C.D_Pos" ) 
+                    )
+  
+  df$Sex = factor(df$Sex, 
+                       levels =c(
+       "F" ,"M") 
+                    )
+  
+
+  #pull out celltype names
+  unique_iso_types <- unique(df[[celltype_col]])
+
+
+  #create list to store model, predictions and coefficients
+  combined_list <- list()
+  model_list <- list()
+  coef_output <- list()
+  pred_output <- list()
+  emma_pairs <- list()
+  
+  for (iso_type in unique_iso_types) {
+
+    #subset datafram to this one cell type
+    subset_df <- subset(df, df[[celltype_col]] ==iso_type)
+
+
+    #transform data since can't have 0s or 1s
+    n <- nrow(subset_df)
+    subset_df$transformed_proportion <- (subset_df$proportion * (n - 1) + 0.5) / n
+    df[df[[celltype_col]] == iso_type, "transformed_proportion"] <- subset_df$transformed_proportion
+    
+    set.seed(12345)
+    #run beta regression
+    #model <- glmmTMB(as.formula(design_formula), family = beta_family(), data = subset_df)
+    model <- betareg(as.formula(design_formula), , data = subset_df)
+    
+    #add model to list
+    combined_list[[paste0(iso_type, "_model")]] <- model  
+    model_list[[paste0(iso_type, "_model")]] <- model 
+    
+    #extract and save coefficients to list
+    coef_table <- summary(model)$coefficients$cond
+    df_coef <- as.data.frame(coef_table)
+    df_coef$Coefficient <- rownames(coef_table)
+    rownames(df_coef) <- NULL
+    
+    df_coef <- df_coef %>% mutate(
+      p_symbol = case_when(
+        `Pr(>|z|)` < 0.001 ~ "***",
+        `Pr(>|z|)` < 0.01 ~ "**",
+        `Pr(>|z|)` < 0.05 ~ "*",
+        TRUE ~ "NS"
+      )
+    )
+    
+    df_coef$Iso_Type <- iso_type
+    
+    combined_list[[paste0(iso_type, "_coef")]] <- df_coef
+    
+    set.seed(12345)
+    emm <- emmeans(model, ~ phenotype | Sex)
+    pairwise <- contrast(emm, method = "pairwise", adjust = "BH")
+    pairwise_df <- as.data.frame(pairwise)
+    pairwise_df$Iso_Type <- iso_type
+    
+    combined_list[[paste0(iso_type, "_pairwise")]] <-pairwise_df
+
+    
+    formula_vars <- all.vars(as.formula(design_formula))[-1]
+    predictors <- subset_df[, formula_vars, drop = FALSE]
+    
+    predictors_vars<-list()
+    # Ensure factors are properly set
+    for (col in colnames(predictors)) {
+        predictors_vars[[col]] <- unique(subset_df[[col]])
+    }
+
+    new_data <- expand.grid(predictors_vars)
+    
+    # Generate predictions
+    new_data$predicted_proportion <- predict(model, newdata = new_data, type = "response")
+    new_data[[celltype_col]] <- iso_type
+    combined_list[[paste0(iso_type, "_predictions")]] <- new_data
+    
+    
+    
+  }
+
+  
+  coef_output <- do.call(rbind, lapply(combined_list[grepl("_coef", names(combined_list))], function(x) x))
+  pred_output <- do.call(rbind, lapply(combined_list[grepl("_predictions", names(combined_list))], function(x) x))
+  
+  pairwise_output <- do.call(rbind, lapply(combined_list[grepl("_pairwise", names(combined_list))], function(x) x))
+
+  #adjust prediction dataframe to match the ggplot naming we've been using previously (ie from numeric to characters)
+  pred_output <- pred_output %>%
+    group_by(.data[[celltype_col]]) %>%
+    mutate(n = n()) %>%
+    mutate(
+      predicted_proportion_original = ((predicted_proportion * n) - 0.5) / (n - 1), #transform back
+      predicted_percentage = predicted_proportion * 100,
+      predicted_percentage_og = predicted_proportion_original * 100
+    ) %>%
+  drop_na()
+  
+  coef_output <- coef_output %>%
+  mutate(
+    FDR = p.adjust(`Pr(>|z|)`, method = "BH"),
+    FDR_symbol = case_when(
+        FDR < 0.001 ~ "***",
+        FDR < 0.01 ~ "**",
+        FDR < 0.05 ~ "*",
+        TRUE ~ "NS"
+      ))
+  
+  
+  pairwise_output <- pairwise_output %>%
+  mutate(
+    FDR = p.value,
+    FDR_symbol = case_when(
+        FDR < 0.001 ~ "***",
+        FDR < 0.01 ~ "**",
+        FDR < 0.05 ~ "*",
+        TRUE ~ "NS"
+      ))
+  
+  model_output <- combined_list
+  
+  
+  return(list(
+    updated_df = df,
+    coefficients = coef_output,
+    predictions = pred_output,
+    pairwise = pairwise_output,
+    models = model_list
+  ))
+}
+
+```
+
+# isotype usage
+
+```{r}
+assign_group <- function(isotype) {
+  switched <- c("IGHA1","IGHA2","IGHG1","IGHG2","IGHG3","IGHG4")
+  nonswitched <- c("IGHM","IGHD")
+  
+  case_when(
+    isotype %in% switched ~ "Class-switched",
+    isotype %in% nonswitched ~ "Non-class-switched",
+    TRUE ~ "Other"
+  )
+}
+
+# 4. Function to process each CDR3 file
+
+process_airr_folder <- function(airr_folder) {
+  airr_files <- list.files(
+    path = airr_folder, 
+    pattern = "_airr.tsv$", 
+    full.names = TRUE
+  )
+
+  airr_list <- list()
+
+  for (file_path in airr_files) {
+    sample_id <- sub(".tsv$", "", basename(file_path))
+
+    airr <- readr::read_tsv(file_path, show_col_types = FALSE) %>%
+      filter(productive == TRUE, locus == "IGH") %>%
+      mutate(
+        sequence_no_N = gsub("N", "", sequence),
+        isotype = sub("\\*.*", "", c_call),
+        isotype = case_when(is.na(isotype) | isotype == "IGHGP" ~ "undetermined",
+                            isotype == "IGHG4A" ~ "IGHG4",
+                            TRUE ~ isotype)
+      )
+
+    airr_list[[sample_id]] <- airr
+  }
+
+  airr_list
+}
+
+
+
+# Annotate clones with AIRR isotype
+
+```
+
+```{r}
+# 2. Define the folder with CDR3 files
+airr_folder <- "~/Trust4/airr_results"
+
+
+# List to store processed data
+airr_list_isotype <- list()
+
+airr_list_isotype <- process_airr_folder(airr_folder)
+
+```
+
+```{r}
+
+annotate_bcr_clonotypes <- function(bcr_data, airr_list) {
+
+  isotype_clone <- list()
+  clones <- list()
+
+  for (sample_id in names(bcr_data$data)) {
+
+    clonotypes <- bcr_data$data[[sample_id]]
+    airr_filtered  <- airr_list[[sample_id]]
+
+    clonotypes_annotated <- clonotypes %>%
+      inner_join(
+        airr_filtered %>% select(sequence_no_N, v_call, v_identity, isotype),
+        by = c("Sequence" = "sequence_no_N")
+      )
+
+    # isotype-level clone summaries
+    isotype_clone[[sample_id]] <- clonotypes_annotated %>%
+      group_by(Cluster, isotype) %>%
+      summarise(
+        merged_clone_size = n(),
+        total_clone_size = sum(Clones, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      mutate(Sample = sample_id)
+
+    # cluster-only summaries
+    clones[[sample_id]] <- clonotypes_annotated %>%
+      group_by(Cluster) %>%
+      summarise(
+        merged_clone_size = n(),
+        total_clone_size = sum(Clones, na.rm = TRUE),
+        .groups = "drop"
+      ) %>%
+      mutate(Sample = sample_id)
+  }
+  
+
+
+  list(
+    isotype_clone = bind_rows(isotype_clone)%>%
+  left_join(bcr_data$meta, by = "Sample"),
+    clone_summary = bind_rows(clones)
+  )
+}
+
+
+```
+
+```{r, fig.height=8}
+summarize_isotypes <- function(isotype_clone_df, meta) {
+
+  # ---- Construct all sample/isotype combinations --------------------------
+  all_combos <- tidyr::expand_grid(
+    Sample = unique(isotype_clone_df$Sample),
+    isotype = unique(isotype_clone_df$isotype)
+  )
+
+  # ---- Total reads per sample ---------------------------------------------
+  total_reads <- isotype_clone_df %>%
+    group_by(Sample) %>%
+    summarise(total_reads = sum(total_clone_size), .groups = "drop") %>%
+    left_join(meta, by = "Sample")
+
+  # ---- Number of clusters per sample ---------------------------------------
+  clusters_per_sample <- isotype_clone_df %>%
+    group_by(Sample) %>%
+    summarise(num_unique_clusters = n_distinct(Cluster), .groups = "drop") %>%
+    left_join(meta, by = "Sample")
+
+  # ---- Cluster-level isotype proportion ------------------------------------
+  isotype_cluster_by_sample <- isotype_clone_df %>%
+    group_by(Sample, Cluster, isotype) %>%
+    summarise(.groups = "drop") %>%
+    group_by(Sample, isotype) %>%
+    summarise(n_clusters = n_distinct(Cluster), .groups = "drop") %>%
+    right_join(all_combos, by = c("Sample", "isotype")) %>%
+    tidyr::replace_na(list(n_clusters = 0)) %>%
+    left_join(clusters_per_sample %>% select(Sample, num_unique_clusters), by = "Sample") %>%
+    mutate(proportion = n_clusters / num_unique_clusters) %>%
+    left_join(meta, by = "Sample")   # <-- metadata added here
+
+  # ---- Read-level isotype proportion ---------------------------------------
+  isotype_by_sample <- isotype_clone_df %>%
+    group_by(Sample, isotype) %>%
+    summarise(isotype_size = sum(total_clone_size), .groups = "drop") %>%
+    right_join(all_combos, by = c("Sample", "isotype")) %>%
+    tidyr::replace_na(list(isotype_size = 0)) %>%
+    left_join(total_reads %>% select(Sample, total_reads), by = "Sample") %>%
+    mutate(proportion = isotype_size / total_reads) %>%
+    left_join(meta, by = "Sample")   # <-- metadata added here
+
+  list(
+    isotype_cluster_by_sample = isotype_cluster_by_sample,
+    isotype_by_sample = isotype_by_sample,
+    clusters_per_sample = clusters_per_sample,
+    total_reads = total_reads
+  )
+}
+
+
+summarize_classswitch <- function(isotype_by_sample,
+                                  isotype_cluster_by_sample,
+                                  meta) {
+  
+  grouped_sample <- isotype_by_sample %>%
+    mutate(isotype_group = assign_group(isotype)) %>%
+    group_by(Sample, isotype_group) %>%
+    summarise(
+      total_isotype_size = sum(isotype_size, na.rm = TRUE),
+      total_reads = dplyr::first(total_reads),
+      proportion = total_isotype_size / total_reads,
+      .groups = "drop"
+    ) %>%
+    left_join(meta, by = "Sample")   # <-- metadata added here too
+  
+  list(
+    classswitch_by_sample = grouped_sample
+  )
+}
+
+```
+
+```{r}
+annot <- annotate_bcr_clonotypes(bcr_igdata, airr_list_isotype)
+
+sample_summaries <- summarize_isotypes(annot$isotype_clone,bcr_igdata$meta)
+
+classswitch_summary <- summarize_classswitch(sample_summaries$isotype_by_sample,sample_summaries$isotype_cluster_by_sample,bcr_igdata$meta)
+
+
+down_annot <- annotate_bcr_clonotypes(down_bcr_igdata, airr_list_isotype)
+
+down_sample_summaries <- summarize_isotypes(down_annot$isotype_clone,down_bcr_igdata$meta)
+
+down_classswitch_summary <- summarize_classswitch(down_sample_summaries$isotype_by_sample,down_sample_summaries$isotype_cluster_by_sample,down_bcr_igdata$meta)
+
+
+```
+
+beta regressions
+
+```{r}
+
+### the pvalue in these is alrady fdr adjusted
+### DOWNSAMPELD
+
+#seqbatch led to lower AIC even in the downsampled model so kept. Better AIC (more neg) with just seqbatch > seqbatch + media > none > media alone
+beta_isogroup_down <- run_betaregression_simple(df =down_classswitch_summary$classswitch_by_sample,
+                   celltype_col = "isotype_group",
+                   design_formula = "transformed_proportion ~ phenotype*Sex +SeqBatch ")
+
+
+beta_isotype_down <- run_betaregression_simple(df =down_sample_summaries$isotype_by_sample,
+                   celltype_col = "isotype",
+                   design_formula = "transformed_proportion ~ phenotype*Sex +SeqBatch")
+
+
+
+### NOT DOWNSAMPLED
+# AIC better (more neg) with just seqbatch > seqbatch + media > none > media only
+beta_isogroup_full <- run_betaregression_simple(df =classswitch_summary$classswitch_by_sample,
+                   celltype_col = "isotype_group",
+                   design_formula = "transformed_proportion ~ phenotype*Sex + SeqBatch")
+
+
+
+beta_isotype_full <- run_betaregression_simple(df =sample_summaries$isotype_by_sample,
+                   celltype_col = "isotype",
+                   design_formula = "transformed_proportion ~ phenotype*Sex + SeqBatch")
+
+```
+##full repertoire
+get sigs for graphing
+
+```{r}
+isotype_full_sigs <- beta_isotype_full$pairwise
+
+isotype_full_sigs <- subset(isotype_full_sigs, FDR <0.05)
+
+facet_max <- sample_summaries$isotype_by_sample %>%
+  group_by(isotype, Sex) %>%
+  summarise(max_prop = max(proportion, na.rm = TRUE), .groups = "drop")
+
+isotype_full_sigs <- isotype_full_sigs %>%
+  tidyr::separate_wider_delim(contrast, delim = " - ", names = c("group1", "group2"), cols_remove = FALSE) %>%
+  rename(isotype = Iso_Type)%>%
+  mutate(group1 = paste(Sex, group1, sep = "_"),
+         group2 = paste(Sex, group2, sep = "_"),
+         FDR.round = round(FDR,3),
+         FDR = case_when(FDR < 0.001 ~ "<0.001",
+                         TRUE ~ as.character(FDR.round)))%>%
+left_join(facet_max, by = c("isotype","Sex")) %>%
+group_by(isotype,Sex) %>%
+ mutate(
+    y.position = {
+      mp <- unique(max_prop)   # ensure it's length 1
+      seq(mp * 1.05, mp * 1.25, length.out = n())
+    }
+  ) %>%
+  ungroup()
+```
+
+```{r, fig.height=3.4, fig.width=8}
+ggplot(sample_summaries$isotype_by_sample , aes(x = phenotype_sex, y = proportion, fill = phenotype_sex)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+  geom_jitter(width = 0.2, height = 0, size = 1, alpha = 0.6, aes(color = phenotype_sex)) +
+  facet_wrap(~ isotype, scales = "free_y", nrow = 2) +
+  labs(
+    title = "Total Proportion of clones(~reads) by Isotype",
+    y = "Proportion of Clones",
+    x = "Group"
+  ) +
+   scale_y_continuous(expand = expansion(mult = c(0, 0.1)))+
+  #scale_y_continuous(breaks = seq(0, 1, by = 0.25))+
+  stat_pvalue_manual(isotype_full_sigs, label = "FDR", size =1.7) +
+  theme_classic() +
+  scale_fill_manual(values=phenocols_sex) +
+  scale_color_manual(values=phenocols_sex_dark) +
+  theme(
+    strip.text = element_text(face = "bold", size =6.5),
+    axis.text.x = element_text(angle = 45, hjust = 1, size =5, color="black"),
+    axis.text.y = element_text(size =5, color="black"),
+    axis.title.y = element_text(size =6, color="black"),
+    axis.title.x = element_text(size =6, color="black"),
+    legend.position = "none"
+  ) 
+
+ggsave(filename = "full_clone_isotype_class_all_pos.pdf", width = 7, height = 3.4)
+```
+
+
+```{r}
+isogroup_full_sigs <- beta_isogroup_full$pairwise
+
+isogroup_full_sigs <- subset(isogroup_full_sigs, FDR <0.05)
+
+isogroup_full_sigs <- isogroup_full_sigs %>%
+  tidyr::separate_wider_delim(contrast, delim = " - ", names = c("group1", "group2"), cols_remove = TRUE) %>%
+  rename(isotype_group = Iso_Type)%>%
+  mutate(group1 = paste(Sex, group1, sep = "_"),
+         group2 = paste(Sex, group2, sep = "_"),
+         FDR = round(FDR,3))%>%
+group_by(isotype_group,Sex) %>%
+  mutate(
+    y.position = seq(
+      max(classswitch_summary$classswitch_by_sample$proportion, na.rm = TRUE) + 0.05,
+      max(classswitch_summary$classswitch_by_sample$proportion, na.rm = TRUE) + 0.2,
+      length.out = n()
+    )
+  ) %>%
+  ungroup()
+```
+
+```{r, fig.height=2.6, fig.width = 8.65}
+ggplot(classswitch_summary$classswitch_by_sample , aes(x = phenotype_sex, y = proportion, fill = phenotype_sex)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(width = 0.2, height = 0, size = 1, alpha = 0.8, aes(color = phenotype_sex)) +
+  facet_wrap(~ isotype_group, scales = "free_y") +
+  labs(
+    title = "Total Proportion of Clones by Isotype - Full",
+    y = "Proportion of Clones",
+    x = "Group"
+  ) +
+  expand_limits(y = max(classswitch_summary$classswitch_by_sample$proportion) * 1.4) +
+  scale_y_continuous(breaks = seq(0, 1, by = 0.25))+
+  stat_pvalue_manual(isogroup_full_sigs, label = "FDR", size =2) +
+  theme_classic() +
+  scale_fill_manual(values=phenocols_sex) +
+  scale_color_manual(values=phenocols_sex_dark) +
+  theme(
+    strip.text = element_text(face = "bold", size =7),
+    axis.text.x = element_text(angle = 45, hjust = 1, size =6, color="black"),
+    axis.text.y = element_text(size =6, color="black"),
+    axis.title.y = element_text(size =7, color="black"),
+    axis.title.x = element_text(size =7, color="black"),
+    legend.position = "none"
+  ) 
+
+ggsave(filename = "full_clone_isotypes_all_pos.pdf", width = 8.65, height = 2.6)
+
+```
+
+## downsampled
+get sigs for graphing
+
+```{r}
+isotype_down_sigs <- beta_isotype_down$pairwise
+
+isotype_down_sigs <- subset(isotype_down_sigs, FDR <0.05)
+
+facet_max <- down_sample_summaries$isotype_by_sample %>%
+  group_by(isotype, Sex) %>%
+  summarise(max_prop = max(proportion, na.rm = TRUE), .groups = "drop")
+
+isotype_down_sigs <- isotype_down_sigs %>%
+  tidyr::separate_wider_delim(contrast, delim = " - ", names = c("group1", "group2"), cols_remove = FALSE) %>%
+  rename(isotype = Iso_Type)%>%
+  mutate(group1 = paste(Sex, group1, sep = "_"),
+         group2 = paste(Sex, group2, sep = "_"),
+         FDR.round = round(FDR,3),
+         FDR = case_when(FDR < 0.001 ~ "<0.001",
+                         TRUE ~ as.character(FDR.round)))%>%
+left_join(facet_max, by = c("isotype","Sex")) %>%
+group_by(isotype,Sex) %>%
+ mutate(
+    y.position = {
+      mp <- unique(max_prop)   # ensure it's length 1
+      seq(mp * 1.05, mp * 1.25, length.out = n())
+    }
+  ) %>%
+  ungroup()
+```
+
+*Supp Fig7a*
+```{r, fig.height=3.4, fig.width=7}
+
+
+ggplot(subset(down_sample_summaries$isotype_by_sample, Infected == "Pos"), aes(x = phenotype_sex, y = proportion, fill = phenotype_sex)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7, median.linewidth = 0.7, box.linewidth = 0.5) +
+  geom_jitter(width = 0.2, height = 0, size = 0.8, alpha = 0.8, aes(color = phenotype_sex)) +
+  facet_wrap(~ isotype, scales = "free_y", nrow=2) +
+  labs(
+    title = "Downsampled Proportion of clones(~reads) by Isotype",
+    y = "Proportion of Clones",
+    x = "Group"
+  ) +
+  stat_pvalue_manual(isotype_down_sigs, label = "FDR", size =1.7) +
+  scale_fill_manual(breaks = unique(down_sample_summaries$phenotype_sex),
+                     values=phenocols_sex) +
+  
+  scale_color_manual(breaks = unique(down_sample_summaries$phenotype_sex),
+                     values=phenocols_sex_dark) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "none"
+  )
+
+
+
+ggsave(filename = "downsampled_clone_isotype_class_all_pos.pdf", width = 7.2, height = 3.4)
+
+```
+
+
+```{r}
+isogroup_down_sigs <- beta_isogroup_down$pairwise
+
+isogroup_down_sigs <- subset(isogroup_down_sigs, FDR <0.05)
+
+isogroup_down_sigs <- isogroup_down_sigs %>%
+  tidyr::separate_wider_delim(contrast, delim = " - ", names = c("group1", "group2"), cols_remove = TRUE) %>%
+  rename(isotype_group = Iso_Type)%>%
+  mutate(group1 = paste(Sex, group1, sep = "_"),
+         group2 = paste(Sex, group2, sep = "_"),
+         FDR = round(FDR,3))%>%
+group_by(isotype_group,Sex) %>%
+  mutate(
+    y.position = seq(
+      max(down_classswitch_summary$classswitch_by_sample$proportion, na.rm = TRUE) + 0.05,
+      max(down_classswitch_summary$classswitch_by_sample$proportion, na.rm = TRUE) + 0.2,
+      length.out = n()
+    )
+  ) %>%
+  ungroup()
+```
+
+*Fig3c*
+```{r, fig.width =7, fig.height=3}
+
+ggplot(subset(down_classswitch_summary$classswitch_by_sample, Infected =="Pos"), aes(x = phenotype_sex, y = proportion, fill = phenotype_sex)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  geom_jitter(width = 0.2, height = 0, size = 1, alpha = 0.9, aes(color = phenotype_sex)) +
+  facet_wrap(~ isotype_group, scales = "free_y") +
+  labs(
+    title = "Downsampled Proportion of clones(~reads) by Isotype",
+    y = "Proportion of Clones",
+    x = "Group"
+  ) +
+  theme_classic() +
+  scale_y_continuous(breaks = seq(0, 1, by = 0.25))+
+  expand_limits(y = max(classswitch_summary$classswitch_by_sample$proportion) * 1.3) +
+  stat_pvalue_manual(isogroup_down_sigs, label = "FDR", size =2) +
+  theme_classic() +
+  scale_fill_manual(values=phenocols_sex) +
+  scale_color_manual(values=phenocols_sex_dark) +
+  theme(
+    strip.text = element_text(face = "bold", size =7),
+    axis.text.x = element_text(angle = 45, hjust = 1, size =6, color="black"),
+    axis.text.y = element_text(size =6, color="black"),
+    axis.title.y = element_text(size =7, color="black"),
+    axis.title.x = element_text(size =7, color="black"),
+    legend.position = "none"
+  ) 
+
+
+ggsave(filename = "downsampled_clone_isotypes_all_pos.pdf", width = 8.7, height = 2.55)
+```
+
+# clonotype evaluation BCR
+
+When .method is set to "volume" the repExplore calculates the number of unique clonotypes in the input data. i did this myself above
+
+instead of having to rewrite every single code below to use the clusters, im going to modify the immdata files to be cluster based, rather than individual clone based
+
+```{r}
+clustered_bcr_igdata <- list()
+
+for (i in seq_along(bcr_igdata$data)) {
+  name <- names(bcr_igdata$data)[[i]]
+  x <- bcr_igdata$data[[i]]
+  
+clustered_bcr_igdata[[name]] <- x %>%
+  group_by(Cluster) %>%
+  summarise(
+    Clones = sum(Clones),
+    V.name = names(which.max(table(V.name))),
+    J.name = names(which.max(table(J.name))),
+    CDR3.nt = names(which.max(table(CDR3.nt))),
+    CDR3.aa = names(which.max(table(CDR3.aa))),
+    
+    .groups = "drop"
+  ) %>%
+    mutate(Proportion = Clones / sum(Clones, na.rm = TRUE))
+  
+}
+
+clustered_bcr_igdata <- list(data = clustered_bcr_igdata, meta = bcr_igdata$meta)
+
+
+
+
+down_clustered_bcr_igdata <- list()
+
+for (i in seq_along(down_bcr_igdata$data)) {
+  name <- names(down_bcr_igdata$data)[[i]]
+  x <- down_bcr_igdata$data[[i]]
+  
+down_clustered_bcr_igdata[[name]] <- x %>%
+  group_by(Cluster) %>%
+  summarise(
+    Clones = sum(Clones),
+    V.name = names(which.max(table(V.name))),
+    J.name = names(which.max(table(J.name))),
+    CDR3.nt = names(which.max(table(CDR3.nt))),
+    CDR3.aa = names(which.max(table(CDR3.nt))),
+    .groups = "drop"
+  ) %>% 
+  mutate(Proportion = Clones / sum(Clones, na.rm = TRUE))
+  
+}
+
+down_clustered_bcr_igdata <- list(data = down_clustered_bcr_igdata, meta = down_bcr_igdata$meta)
+
+
+
+```
+
+## expansion
+
+### full repertoire
+
+```{r, fig.height=1.65, fig.width = 2.35}
+
+imm_hom <- repClonality(clustered_bcr_igdata$data,
+  .method = "homeo",
+  .clone.types = c(Small = .01, Medium = .05, Large = .1, Hyperexpanded = 1) 
+)
+imm_hom_meta <- merge(imm_hom, clustered_bcr_igdata$meta, by.x = "row.names", by.y = "Sample")
+
+
+# Pivot to long format
+long_hom <- imm_hom_meta %>%
+  pivot_longer(
+    cols = c("Small (0 < X <= 0.01)",
+             "Medium (0.01 < X <= 0.05)",
+             "Large (0.05 < X <= 0.1)",
+             "Hyperexpanded (0.1 < X <= 1)"),
+    names_to = "CloneSize",
+    values_to = "Proportion"
+  )
+
+
+# Ensure correct factor order
+long_hom$CloneSize <- factor(long_hom$CloneSize,
+  levels = c("Small (0 < X <= 0.01)",
+             "Medium (0.01 < X <= 0.05)",
+             "Large (0.05 < X <= 0.1)",
+             "Hyperexpanded (0.1 < X <= 1)"),
+  labels = c("Small (0 - 0.01]",
+             "Medium (0.01 - 0.05]",
+             "Large (0.05 - 0.1]",
+             "Hyperexpanded (0.1 - 1]"))
+long_hom$Proportion <- as.numeric(long_hom$Proportion)
+
+long_hom <- droplevels(long_hom)
+
+long_hom<- long_hom %>%
+  complete(phenotype, CloneSize, fill = list(Value = 0))
+
+```
+
+stats
+
+```{r, fig.height = 1.5, fig.width=2.15}
+
+expanded_fraction_df <- do.call(rbind,
+  lapply(names(clustered_bcr_igdata$data), function(name) {
+    
+    df <- clustered_bcr_igdata$data[[name]]
+    
+    total_reads <- sum(df$Clones, na.rm = TRUE)
+    
+    # Calculate clone frequencies
+    df$freq <- df$Clones / total_reads
+    
+    expanded_fraction <- sum(df$freq[df$freq > 0.01], na.rm = TRUE)
+    
+    data.frame(
+      Sample = name,
+      expanded_fraction_1 = expanded_fraction,
+      total_clones = total_reads
+    )
+  })
+)
+
+
+expanded_fraction_df <- merge(expanded_fraction_df, clustered_bcr_igdata$meta,by = "Sample")
+
+
+    #transform data since can't have 0s or 1s
+    n <- nrow(expanded_fraction_df)
+    expanded_fraction_df$transformed_proportion <- (expanded_fraction_df$expanded_fraction_1 * (n - 1) + 0.5) / n
+
+    
+    set.seed(12345)
+    #run beta regression. no covariates = + seqbatch. keep simpler model
+   beta_0.01 <- betareg(transformed_proportion ~ phenotype*Sex , data = expanded_fraction_df)
+    
+    set.seed(12345)
+    emm <- emmeans(beta_0.01, ~ phenotype | Sex)
+    pairwise <- contrast(emm, method = "pairwise", adjust = "BH")
+    emm_pairwise_beta0.01 <- as.data.frame(pairwise)
+
+    
+
+
+expand_prop_sigs <- emm_pairwise_beta0.01 %>%
+  filter(p.value <0.05)%>%
+  tidyr::separate_wider_delim(contrast, delim = " - ", names = c("group1", "group2"), cols_remove = FALSE) %>%
+  mutate(
+         FDR.round = round(p.value,3),
+         FDR = case_when(FDR.round < 0.001 ~ "<0.001",
+                         TRUE ~ as.character(FDR.round)))%>%
+ mutate(
+    y.position = {
+      mp <- unique(max(expanded_fraction_df$expanded_fraction_1))   # ensure it's length 1
+      seq(mp * 1.05, mp * 1.2, length.out = n())
+    }
+  ) 
+ 
+
+ggplot(expanded_fraction_df,
+  aes(x = phenotype, y = expanded_fraction_1, fill = phenotype_sex)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  geom_point(aes(color =  phenotype_sex),position = position_jitterdodge(
+    dodge.width = 0.8,jitter.width = 0.5,jitter.height = 0),
+  size = 0.4,alpha = 0.8
+) +
+  labs(x = "Phenotype", y = "Proportion", fill = "Clone Size") +
+  facet_wrap(~Sex) +
+  scale_fill_manual(values=phenocols_sex) +
+   stat_pvalue_manual(expand_prop_sigs, label = "FDR", size =2) +
+  scale_color_manual(values=phenocols_sex_dark) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1)))+
+  theme(strip.text = element_text(face = "bold", size =6),
+        axis.text.x = element_text(angle = 45, hjust = 1, color="black"),
+        axis.title.x = element_text(size = 0, color="black"),
+        legend.position = "none")
+
+ggsave("clonesize_expanded_only.pdf", height=1.55, width=1.95)
+```
+
+```{r, fig.height = 2, fig.width = 4.1}
+avg_hom <- long_hom %>%
+  group_by(phenotype_sex, CloneSize) %>%
+  summarise(
+    mean_prop = mean(Proportion, na.rm = TRUE),
+    sd_prop   = sd(Proportion, na.rm = TRUE),
+    n         = n(),
+    se_prop   = sd_prop / sqrt(n),
+    .groups = "drop"
+  )
+
+avg_hom_expanded <- subset(avg_hom, CloneSize != "Small (0 - 0.01]")
+
+avg_hom_expanded  <- avg_hom_expanded %>% mutate(
+  Sex = case_when(str_starts(phenotype_sex,"F") ~ "Female",
+                  str_starts(phenotype_sex,"M") ~ "Male"),
+  Phenotype = str_sub(phenotype_sex, 3, -5)
+)
+
+## note emmmeans are already FDR adjusted
+max_prop <- avg_hom_expanded %>%
+  group_by(Phenotype,Sex) %>%
+  summarise(max_prop = sum(mean_prop))
+max_prop <- max(max_prop$max_prop)
+   
+expand_prop_sigs2 <- expand_prop_sigs %>%
+mutate(group1 = str_sub(group1,1, -5),
+         group2 = str_sub(group2,1, -5),
+       Sex = case_when(Sex == "F" ~ "Female",
+                  Sex =="M" ~ "Male"),
+        y.position = {
+      mp <- unique(max_prop)   # ensure it's length 1
+      seq(mp * 1.05, mp * 1.2, length.out = n())
+      })
+
+ggplot(avg_hom_expanded,
+       aes(x = Phenotype, y = mean_prop, fill = CloneSize)) +
+  geom_col(position = "stack") +
+  labs(x = "Phenotype", y = "Mean proportion", fill = "Clone Size") +
+  facet_wrap(~Sex)+
+  theme_classic() +
+   stat_pvalue_manual(expand_prop_sigs2, label = "FDR", size =2) +
+  scale_fill_manual(values = rev(inferno(9)[c(2,3,5)]))+
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1)))+
+  theme(strip.text = element_text(face = "bold", size =7),
+    axis.text.x = element_text(angle = 45, hjust = 1, size =6, color="black"),
+    axis.text.y = element_text(size =6, color="black"),
+    axis.title.y = element_text(size =7, color="black"),
+    axis.title.x = element_text(size =0, color="black"),
+    legend.text = element_text(size = 5.5),
+    legend.title = element_text(size = 6),
+    legend.key.size = unit(11, "pt"))
+
+
+ggsave("clonesize_stacked_expanded_only.pdf", height=2, width=4.1)
+
+```
+
+### downsampled
+
+```{r, fig.height=2.6, fig.width=4.7}
+
+imm_hom_down <- repClonality(down_clustered_bcr_igdata$data,
+  .method = "homeo",
+  .clone.types = c(Small = .01, Medium = .05, Large = .1, Hyperexpanded = 1)  ## adjusted since the most i have is like 1000 something clones and some have as few as like 58
+)
+imm_hom_meta_down <- merge(imm_hom_down, down_clustered_bcr_igdata$meta, by.x = "row.names", by.y = "Sample")
+
+
+# Pivot to long format
+long_hom_down <- imm_hom_meta_down %>%
+  pivot_longer(
+    cols = c("Small (0 < X <= 0.01)",
+             "Medium (0.01 < X <= 0.05)",
+             "Large (0.05 < X <= 0.1)",
+             "Hyperexpanded (0.1 < X <= 1)"),
+    names_to = "CloneSize",
+    values_to = "Proportion"
+  )
+
+
+# Ensure correct factor order
+long_hom_down$CloneSize <- factor(long_hom_down$CloneSize,
+  levels = c("Small (0 < X <= 0.01)",
+             "Medium (0.01 < X <= 0.05)",
+             "Large (0.05 < X <= 0.1)",
+             "Hyperexpanded (0.1 < X <= 1)"),
+  labels = c("Small (0 - 0.01]",
+             "Medium (0.01 - 0.05]",
+             "Large (0.05 - 0.1]",
+             "Hyperexpanded (0.1 - 1]"))
+long_hom_down$Proportion <- as.numeric(long_hom_down$Proportion)
+long_hom_down <- droplevels(long_hom_down)
+
+long_hom_down<- long_hom_down %>%
+  complete(phenotype, CloneSize, fill = list(Value = 0))
+
+```
+
+stats
+
+```{r, fig.height = 1.65, fig.width=2.35}
+
+down_expanded_fraction_df <- do.call(rbind,
+  lapply(names(down_clustered_bcr_igdata$data), function(name) {
+    
+    df <- down_clustered_bcr_igdata$data[[name]]
+    
+    total_reads <- sum(df$Clones, na.rm = TRUE)
+    
+    # Calculate clone frequencies
+    df$freq <- df$Clones / total_reads
+    
+    expanded_fraction <- sum(df$freq[df$freq > 0.01], na.rm = TRUE)
+    
+    data.frame(
+      Sample = name,
+      expanded_fraction_1 = expanded_fraction,
+      total_clones = total_reads
+    )
+  })
+)
+
+
+down_expanded_fraction_df <- merge(down_expanded_fraction_df, down_clustered_bcr_igdata$meta,by = "Sample")
+
+
+    #transform data since can't have 0s or 1s
+    n <- nrow(down_expanded_fraction_df)
+    down_expanded_fraction_df$transformed_proportion <- (down_expanded_fraction_df$expanded_fraction_1 * (n - 1) + 0.5) / n
+
+    
+    set.seed(12345)
+    #run beta regression AIC better with seqbatch = seqbatch + media, = none = media
+   down_beta_0.01 <- betareg(transformed_proportion ~ phenotype*Sex , data = down_expanded_fraction_df)
+    
+    set.seed(12345)
+    down_emm <- emmeans(down_beta_0.01, ~ phenotype | Sex)
+    down_pairwise <- contrast(down_emm, method = "pairwise", adjust = "BH")
+    down_emm_pairwise_beta0.01 <- as.data.frame(down_pairwise)
+
+    
+
+
+down_expand_prop_sigs <- down_emm_pairwise_beta0.01 %>%
+  filter(p.value <0.05)%>%
+  tidyr::separate_wider_delim(contrast, delim = " - ", names = c("group1", "group2"), cols_remove = FALSE) %>%
+  mutate(
+         FDR.round = round(p.value,3),
+         FDR = case_when(FDR.round < 0.001 ~ "<0.001",
+                         TRUE ~ as.character(FDR.round)))%>%
+ mutate(
+    y.position = {
+      mp <- unique(max(down_expanded_fraction_df$expanded_fraction_1))   # ensure it's length 1
+      seq(mp * 1.05, mp * 1.2, length.out = n())
+    }
+  ) 
+ 
+
+ggplot(down_expanded_fraction_df,
+  aes(x = phenotype, y = expanded_fraction_1, fill = phenotype_sex)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.7) +
+  geom_point(aes(color =  phenotype_sex),position = position_jitterdodge(
+    dodge.width = 0.8,jitter.width = 0.5,jitter.height = 0),
+  size = 0.4,alpha = 0.8
+) +
+  labs(x = "Phenotype", y = "Proportion", fill = "Clone Size") +
+  facet_wrap(~Sex) +
+  scale_fill_manual(values=phenocols_sex) +
+   stat_pvalue_manual(down_expand_prop_sigs, label = "FDR", size =1.75) +
+  scale_color_manual(values=phenocols_sex_dark) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1)))+
+  theme(strip.text = element_text(face = "bold", size =6),
+        axis.text.x = element_text(angle = 45, hjust = 1, color="black"),
+        axis.title.x = element_text(size = 0, color="black"),
+        legend.position = "none")
+
+ggsave("down_clonesize_expanded_only.pdf",height=1.55, width=1.95)
+```
+
+```{r, fig.height = 2.2, fig.width = 4.1}
+down_avg_hom <- long_hom_down %>%
+  group_by(phenotype_sex, CloneSize) %>%
+  summarise(
+    mean_prop = mean(Proportion, na.rm = TRUE),
+    sd_prop   = sd(Proportion, na.rm = TRUE),
+    n         = n(),
+    se_prop   = sd_prop / sqrt(n),
+    .groups = "drop"
+  )
+
+down_avg_hom_expanded <- subset(down_avg_hom, CloneSize != "Small (0 - 0.01]")
+
+down_avg_hom_expanded  <- down_avg_hom_expanded %>% mutate(
+  Sex = case_when(str_starts(phenotype_sex,"F") ~ "Female",
+                  str_starts(phenotype_sex,"M") ~ "Male"),
+  Phenotype = str_sub(phenotype_sex, 3, -5)
+)
+
+## note emmmeans are already FDR adjusted
+down_max_prop <- down_avg_hom_expanded %>%
+  group_by(Phenotype,Sex) %>%
+  summarise(max_prop = sum(mean_prop))
+down_max_prop <- max(down_max_prop$max_prop)
+   
+down_expand_prop_sigs2 <- down_expand_prop_sigs %>%
+mutate(group1 = str_sub(group1,1, -5),
+         group2 = str_sub(group2,1, -5),
+       Sex = case_when(Sex == "F" ~ "Female",
+                  Sex =="M" ~ "Male"),
+        y.position = {
+      mp <- unique(down_max_prop)   # ensure it's length 1
+      seq(mp * 1.05, mp * 1.45, length.out = n())
+      })
+
+ggplot(down_avg_hom_expanded,
+       aes(x = Phenotype, y = mean_prop, fill = CloneSize)) +
+  geom_col(position = "stack") +
+  labs(x = "Phenotype", y = "Mean proportion", fill = "Clone Size") +
+  facet_wrap(~Sex)+
+  theme_classic() +
+   stat_pvalue_manual(down_expand_prop_sigs2, label = "FDR", size =2) +
+  scale_fill_manual(values = rev(inferno(9)[c(2,3,5)]))+
+  scale_y_continuous(expand = expansion(mult = c(0, 0.08)))+
+  theme(strip.text = element_text(face = "bold", size =7),
+    axis.text.x = element_text(angle = 45, hjust = 1, size =6, color="black"),
+    axis.text.y = element_text(size =6, color="black"),
+    axis.title.y = element_text(size =7, color="black"),
+    axis.title.x = element_text(size =0, color="black"),
+    legend.text = element_text(size = 5.5),
+    legend.title = element_text(size = 6),
+    legend.key.size = unit(11, "pt"))
+
+
+ggsave("down_clonesize_stacked_expanded_only.pdf", height=2.2, width=4.1)
+
+```
+
+
+## rarefaction
+
+### full repertoire
+
+
+
+```{r}
+
+sum_list <- data.frame(
+  Sample = character(),
+  TotalClones = numeric(),
+  stringsAsFactors = FALSE
+)
+
+
+for (i in seq_along(clustered_bcr_igdata$data)) {
+
+  sample_name <- names(clustered_bcr_igdata$data)[i]
+  x <- clustered_bcr_igdata$data[[i]]
+
+  total_clones <- sum(x$Clones, na.rm = TRUE)
+  
+
+  sum_list <- rbind(sum_list,
+                    data.frame(Sample = sample_name,
+                               TotalClones = total_clones))
+}
+
+I'm taking for scRepertoire code below and modifying for my purposes 
+
+
+clonalRarefactionDF <- function(sample_list, 
+                                sample_col = "Sample",
+                                clonotype_col = "CDR3.nt",
+                                count_col = "Clones",
+                                hill.numbers = 0,
+                                n.boots = 20,
+                                plot.type = 1,
+                                end.point = NULL,
+                                knots = knots,
+                                palette = "inferno",
+                                facet_by = NULL,   # new argument for grouping variable in meta
+                                exportTable = FALSE) {
+  
+  # --- 1. Build list of abundance vectors ---
+  mat.list <- lapply(sample_list$data, function(x) {
+    setNames(x[[count_col]], x[[clonotype_col]])
+  })
+  
+  # --- 2. Run iNEXT ---
+  mat <- iNEXT(mat.list, q = hill.numbers,
+               datatype = "abundance", nboot = n.boots, endpoint = end.point, knots = knots)
+
+  # --- 3. Extract the data used by ggiNEXT ---
+  df <- fortify(mat, type = 1)
+  colnames(df)[colnames(df) == "Assemblage"] <- sample_col
+    # merge metadata into BOTH curve df and observed df
+  
+if (!is.null(sample_list$meta)) {
+  df <- merge(df, sample_list$meta, by = "Sample", all.x = TRUE)
+}
+
+  df.point <- df[df$Method == "Observed", ]
+  df.line  <- df[df$Method != "Observed", ]
+
+  df.line$Method <- factor(
+    df.line$Method,
+    c("Rarefaction", "Extrapolation")
+  )
+  
+p <- ggplot(df, aes(x = x, y = y, colour = Sample)) +
+  geom_point(size = 2, data = df.point) +
+    geom_line(
+    data = df.line[df.line$Method == "Rarefaction", ],
+    aes(x = x, y = y, colour = Sample, linetype = Method),
+    linewidth = 1
+  ) +
+  # extrapolation lines with alpha 0.5
+  geom_line(
+    data = df.line[df.line$Method == "Extrapolation", ],
+    aes(x = x, y = y, colour = Sample, linetype = Method),
+    linewidth = 1,
+    alpha = 0.5
+  )  +
+  geom_ribbon(
+    aes(ymin = y.lwr, ymax = y.upr, fill = Sample, colour = NULL),
+    alpha = 0.1
+  ) +
+  labs(
+    x = "Number of individuals",
+    y = "Diversity"
+  ) +
+  theme_minimal() +
+  scale_color_viridis_d() +
+  scale_fill_viridis_d() +
+  labs(
+    x = "Sample Size",
+    y = "Diversity",
+    color = sample_col,
+    fill = sample_col
+  )
+
+  
+  
+  if (exportTable) {
+    return(df)  # raw rarefaction/extrapolation data with metadata
+  } else {
+    return(p)   # plot
+  }
+}
+
+
+
+raref_p<- clonalRarefactionDF(clustered_bcr_igdata,
+                              n.boots =2, 
+                              end.point = 20000,#max(sum_list$TotalClones), 
+                              knots = 100)
+
+raref_df<- clonalRarefactionDF(clustered_bcr_igdata,
+                              n.boots =2, 
+                              end.point = 20000,#max(sum_list$TotalClones), 
+                              knots = 100, exportTable = TRUE)
+
+raref_p + theme(legend.position = "none") + #scale_x_continuous(limits = c(0,15000)) + 
+  facet_wrap(~phenotype_sex, nrow =2) +
+  labs(y = "Richness") + 
+   theme(strip.text = element_text(face = "bold", size =7),
+    axis.text.x = element_text(angle = 45, hjust = 1, size =6, color="black"),
+    axis.text.y = element_text(size =6, color="black"),
+    axis.title.y = element_text(size =7, color="black"),
+    axis.title.x = element_text(size =7, color="black"),
+    legend.text = element_text(size = 5.5),
+    legend.title = element_text(size = 6),
+    legend.key.size = unit(11, "pt"))
+
+
+ggsave("rarefaction_hill0.pdf", height=2.7, width=4.5)
+
+
+# by group
+
+meta <- clustered_bcr_igdata$meta
+data_list <- clustered_bcr_igdata$data
+
+# add sample name column to each dataframe
+data_list <- imap(data_list, ~ mutate(.x, Sample = .y))
+
+# combine everything
+combined <- bind_rows(data_list)
+
+# add group from metadata
+combined <- combined %>%
+  left_join(meta, by = "Sample")
+
+# split by group
+group_data <- combined %>%
+  mutate(phenotype_sex = droplevels(phenotype_sex)) %>%
+  split(.$phenotype_sex)
+
+# replace data slot
+group_bcr_data <- list()
+ group_bcr_data$meta <- meta
+ group_bcr_data$data <- group_data
+ 
+ 
+ sum_list_group <- data.frame(
+  Group = character(),
+  TotalClones = numeric(),
+  stringsAsFactors = FALSE
+)
+
+ 
+ for (i in seq_along(group_bcr_data$data)) {
+
+  sample_name <- names(group_bcr_data$data)[i]
+  x <- group_bcr_data$data[[i]]
+
+  total_clones <- sum(x$Clones, na.rm = TRUE)
+  
+
+  sum_list_group <- rbind(sum_list_group,
+                    data.frame(Group = sample_name,
+                               TotalClones = total_clones))
+}
+
+ 
+raref_group_p<- clonalRarefactionDF(group_bcr_data,
+                              n.boots =2, 
+                               hill.numbers = 0,
+                              end.point = max(sum_list_group$TotalClones) + 200, 
+                              knots = 100)
+
+raref_group_p_0 <- raref_group_p + scale_color_manual(values=phenocols_sex) + scale_fill_manual(values=phenocols_sex)+
+  labs(y = "Richness") + 
+   theme(strip.text = element_text(face = "bold", size =7),
+    axis.text.x = element_text(angle = 45, hjust = 1, size =5.5, color="black"),
+    axis.text.y = element_text(size =5.5, color="black"),
+    axis.title.y = element_text(size =6, color="black"),
+    axis.title.x = element_text(size =6, color="black"),
+    legend.text = element_text(size = 5),
+    legend.title = element_text(size = 5.5),
+    legend.key.size = unit(9, "pt"))
+
+
+
+
+raref_group_p_1<- clonalRarefactionDF(group_bcr_data,
+                              n.boots =2, 
+                               hill.numbers = 1,
+                              end.point = max(sum_list_group$TotalClones) + 200, 
+                              knots = 100)
+
+raref_group_p_1<- raref_group_p_1 + 
+  labs(y = "exponential of Shannon entropy") + 
+  scale_color_manual(values=phenocols_sex) + 
+  scale_fill_manual(values=phenocols_sex) +
+   theme(strip.text = element_text(face = "bold", size =7),
+    axis.text.x = element_text(angle = 45, hjust = 1, size =5.5, color="black"),
+    axis.text.y = element_text(size =5.5, color="black"),
+    axis.title.y = element_text(size =6, color="black"),
+    axis.title.x = element_text(size =6, color="black"),
+    legend.text = element_text(size = 5),
+    legend.title = element_text(size = 5.5),
+    legend.key.size = unit(9, "pt"))
+
+
+
+
+
+raref_group_p_2<- clonalRarefactionDF(group_bcr_data,
+                              n.boots =2, 
+                               hill.numbers = 2,
+                              end.point = max(sum_list_group$TotalClones) + 200, 
+                              knots = 100)
+
+raref_group_p_2 <- raref_group_p_2 + 
+  scale_color_manual(values=phenocols_sex) + 
+  scale_fill_manual(values=phenocols_sex) +
+  labs(y = "Inverse of Simpson's index",
+       x = "Sample Size") + 
+   theme(strip.text = element_text(face = "bold", size =7),
+    axis.text.x = element_text(angle = 45, hjust = 1, size =5.5, color="black"),
+    axis.text.y = element_text(size =5.5, color="black"),
+    axis.title.y = element_text(size =6, color="black"),
+    axis.title.x = element_text(size =6, color="black"),
+    legend.text = element_text(size = 5),
+    legend.title = element_text(size = 5.5),
+    legend.key.size = unit(9, "pt"))
+
+
+
+
+
+
+# Combine the plots
+raref_group_combined_plot <- (raref_group_p_0 + raref_group_p_1 + raref_group_p_2) + 
+  plot_layout(guides = "collect") & 
+  theme(legend.position = "right")
+
+# Display the plot
+raref_group_combined_plot
+
+
+ggsave("rarefaction_hill_all_group.pdf", height=1.6, width=5.4)
+
+```
+
+## Diversity
+
+seqbatch had negligible effect on AIC in the downsampled model so just added variable for depth in the full model but idk if that is even needed
+
+### full repertoire
+
+#### simpson
+
+```{r, fig.height=2.2, fig.width=2.3}
+
+total_clones_per_sample <- data.frame(Sample = character(),
+                                      total_clones = numeric(),
+                                      stringsAsFactors = FALSE)
+
+
+for(i in seq_along(clustered_bcr_igdata$data)) {
+  name <- names(clustered_bcr_igdata$data)[[i]]
+  df <- clustered_bcr_igdata$data[[i]]
+  
+  Bcell_depth <- sum(df$Clones, na.rm = TRUE)
+  
+  # Add a row to the data.frame
+  total_clones_per_sample <- rbind(total_clones_per_sample,
+                                   data.frame(Sample = name,
+                                              total_clones = Bcell_depth))
+}
+
+
+
+
+div_inv.simpson <- repDiversity(clustered_bcr_igdata$data, "inv.simp",.col = "nt+v+j",.do.norm=TRUE)
+div_inv.simpson_meta <- merge(div_inv.simpson, clustered_bcr_igdata$meta, by = "Sample")
+div_inv.simpson_meta <- merge(div_inv.simpson_meta,total_clones_per_sample, by = "Sample")
+
+
+
+
+set.seed(12345)
+lm_inv.simp<-lm(Value ~ phenotype*Sex + SeqBatch, data = div_inv.simpson_meta)
+set.seed(12345)
+emm <- emmeans(lm_inv.simp, ~ phenotype | Sex)
+pairwise <- contrast(emm, method = "pairwise", adjust = "BH")
+emm_pairwise_inv.simp <- as.data.frame(pairwise)
+
+
+#pval is already adjusted
+simpson_sig <- emm_pairwise_inv.simp  %>%
+  tidyr::separate_wider_delim(contrast, delim = " - ", names = c("group1", "group2"), cols_remove = FALSE) %>%
+  mutate(group1 = paste(Sex, group1, sep = "_"),
+         group2 = paste(Sex, group2, sep = "_"),
+         FDR = round(p.value,3))%>%
+filter(FDR < 0.05)%>%
+ group_by(Sex) %>%
+  mutate(
+    y.position = seq(
+      max(div_inv.simpson_meta$Value, na.rm = TRUE) *1.10,
+      max(div_inv.simpson_meta$Value, na.rm = TRUE) *1.20,
+      length.out = n()
+    )
+  ) %>%
+  ungroup()
+
+
+ggplot(div_inv.simpson_meta, aes(x=phenotype_sex, y = Value, fill = phenotype_sex))+ 
+  geom_boxplot(outliers = FALSE, alpha = 0.8) + 
+  geom_jitter(width =0.1, height =0, size =0.5) +
+  labs(y = "inverse Simpson index",
+       title = "Full sample",
+       x = NULL)+
+     scale_y_continuous(expand = expansion(mult = c(0, 0.1)))+
+  stat_pvalue_manual(simpson_sig, label = "FDR", size =1.75) +
+  scale_fill_manual(values=phenocols_sex) +
+  scale_color_manual(values=phenocols_sex_dark)  + theme(legend.position = "none")
+
+
+
+
+ggsave("inv_simpson.pdf", height=1.7, width=2.04)
+
+```
+
+#### gini
+
+```{r}
+div_gini <- repDiversity(clustered_bcr_igdata$data, "gini",.col = "nt+v+j")
+
+div_gini_meta <- merge(div_gini, clustered_bcr_igdata$meta,  by.x ="row.names",by.y = "Sample")
+div_gini_meta <- merge(div_gini_meta,total_clones_per_sample, by.x ="Row.names",by.y = "Sample")
+
+
+plot(V1 ~ total_clones, data = div_gini_meta, xlim = c(0, 20000))
+
+
+
+
+set.seed(12345)
+# seqbatch = none
+lm_gini<-lm(log10(V1) ~ phenotype*Sex + SeqBatch, data = div_gini_meta)
+set.seed(12345)
+emm <- emmeans(lm_gini, ~ phenotype | Sex)
+pairwise <- contrast(emm, method = "pairwise", adjust = "BH")
+emm_pairwise_gini <- as.data.frame(pairwise)
+
+
+#pval is already adjusted
+gini_sig <- emm_pairwise_gini  %>%
+  tidyr::separate_wider_delim(contrast, delim = " - ", names = c("group1", "group2"), cols_remove = FALSE) %>%
+  mutate(group1 = paste(Sex, group1, sep = "_"),
+         group2 = paste(Sex, group2, sep = "_"),
+         FDR = round(p.value,3))%>%
+filter(FDR < 0.05)%>%
+ group_by(Sex) %>%
+  mutate(
+    y.position = seq(
+      max(div_gini_meta$V1, na.rm = TRUE) *1.10,
+      max(div_gini_meta$V1, na.rm = TRUE) *1.20,
+      length.out = n()
+    )
+  ) %>%
+  ungroup()
+
+
+ggplot(div_gini_meta, aes(x=phenotype_sex, y = V1, fill = phenotype_sex))+ 
+  geom_boxplot(outliers = FALSE, alpha = 0.8) + 
+  geom_jitter(width =0.1, height =0, size = 0.5) +
+  scale_fill_manual(breaks = unique(down_sample_summaries$phenotype_sex),
+                     values=phenocols_sex) +
+  stat_pvalue_manual(gini_sig, label = "FDR", size =1.75) +
+  scale_color_manual(breaks = unique(down_sample_summaries$phenotype_sex),
+                     values=phenocols_sex_dark) +
+  labs(y = "Gini",
+       title = "Full sample",
+       x = NULL)
+
+ggsave("gini.pdf", height=1.6, width=1.88)
+```
+
+#### shannon
+
+```{r}
+div_shannon <- repDiversity(clustered_bcr_igdata$data, "hill",.min.q=1, .max.q=1,.col = "nt+v+j")
+
+div_shannon_meta <- merge(div_shannon, clustered_bcr_igdata$meta,  by = "Sample")
+div_shannon_meta <- merge(div_shannon_meta,total_clones_per_sample, by = "Sample")
+
+
+set.seed(12345)
+lm_shannon<-lm(Value ~ phenotype*Sex + SeqBatch, data = div_shannon_meta)
+set.seed(12345)
+emm <- emmeans(lm_shannon, ~ phenotype | Sex)
+pairwise <- contrast(emm, method = "pairwise", adjust = "BH")
+emm_pairwise_shannon <- as.data.frame(pairwise)
+
+
+#pval is already adjusted
+shannon_sig <- emm_pairwise_shannon %>%
+  tidyr::separate_wider_delim(contrast, delim = " - ", names = c("group1", "group2"), cols_remove = FALSE) %>%
+  mutate(group1 = paste(Sex, group1, sep = "_"),
+         group2 = paste(Sex, group2, sep = "_"),
+         FDR = round(p.value,3))%>%
+filter(FDR < 0.05)%>%
+ group_by(Sex) %>%
+  mutate(
+    y.position = seq(
+      max(div_shannon_meta$Value, na.rm = TRUE) *1.10,
+      max(div_shannon_meta$Value, na.rm = TRUE) *1.20,
+      length.out = n()
+    )
+  ) %>%
+  ungroup()
+
+plot(Value ~ total_clones, data = div_shannon_meta, xlim = c(0, 20000))
+
+ggplot(div_shannon_meta, aes(x=phenotype_sex, y = Value, fill = phenotype_sex))+ 
+  geom_boxplot(outliers = FALSE, alpha = 0.8) + 
+  geom_jitter(width =0.1, height =0, size = 0.5) +
+  scale_fill_manual(breaks = unique(down_sample_summaries$phenotype_sex),
+                     values=phenocols_sex) +
+  stat_pvalue_manual(shannon_sig, label = "FDR", size =1.75) +
+  scale_color_manual(breaks = unique(down_sample_summaries$phenotype_sex),
+                     values=phenocols_sex_dark) +
+  labs(y = "exponential of Shannon's entropy",
+       title = "Full sample",
+       x = NULL)
+
+
+
+ggsave("exp_shannon.pdf", height=1.7, width=2.04)
+```
+
+### downsampled
+
+#### simpson
+
+```{r, fig.height=2.2, fig.width=2.3}
+
+total_clones_per_downsample <- data.frame(Sample = character(),
+                                      total_clones = numeric(),
+                                      stringsAsFactors = FALSE)
+
+
+for(i in seq_along(down_clustered_bcr_igdata$data)) {
+  name <- names(down_clustered_bcr_igdata$data)[[i]]
+  df <- down_clustered_bcr_igdata$data[[i]]
+  
+  Bcell_depth <- sum(df$Clones, na.rm = TRUE)
+  
+  # Add a row to the data.frame
+  total_clones_per_downsample <- rbind(total_clones_per_downsample,
+                                   data.frame(Sample = name,
+                                              total_clones = Bcell_depth))
+}
+
+div_inv.simpson_down <- repDiversity(down_clustered_bcr_igdata$data, "inv.simp",.col = "nt+v+j",.do.norm=TRUE)
+div_inv.simpson_meta_down <- merge(div_inv.simpson_down, down_clustered_bcr_igdata$meta, by = "Sample")
+div_inv.simpson_meta_down <- merge(div_inv.simpson_meta_down,total_clones_per_downsample, by = "Sample")
+
+
+
+
+
+set.seed(12345)
+
+#residuals are super not normal, have to square, but now AIC better with SeqBatch
+#reflection and then logtransform
+t_value = log10(max(div_inv.simpson_meta_down$Value + 1) - div_inv.simpson_meta_down$Value) 
+
+lm_inv.simp_down<-lm(t_value ~ phenotype*Sex + SeqBatch, data = div_inv.simpson_meta_down)
+set.seed(12345)
+
+emm <- emmeans(lm_inv.simp_down, ~ phenotype | Sex)
+pairwise <- contrast(emm, method = "pairwise", adjust = "BH")
+emm_pairwise_inv.simp_down <- as.data.frame(pairwise)
+
+  
+#pval is already adjusted
+simpson_sig_down <- emm_pairwise_inv.simp_down  %>%
+  tidyr::separate_wider_delim(contrast, delim = " - ", names = c("group1", "group2"), cols_remove = FALSE) %>%
+  mutate(group1 = paste(Sex, group1, sep = "_"),
+         group2 = paste(Sex, group2, sep = "_"),
+         FDR = round(p.value,3))%>%
+filter(FDR < 0.050)%>%
+ group_by(Sex) %>%
+  mutate(
+    y.position = seq(
+      max(div_inv.simpson_meta_down$Value, na.rm = TRUE) *1.10,
+      max(div_inv.simpson_meta_down$Value, na.rm = TRUE) *1.20,
+      length.out = n()
+    )
+  ) %>%
+  ungroup()
+
+
+ggplot(div_inv.simpson_meta_down, aes(x=phenotype_sex, y = Value, fill = phenotype_sex))+ 
+  geom_boxplot(outliers = FALSE, alpha = 0.8) + 
+  geom_jitter(width =0.1, height =0, size =0.5) +
+  labs(y = "inverse Simpson index",
+       title = "Downsampled",
+       x = NULL)+
+     scale_y_continuous(expand = expansion(mult = c(0, 0.1)))+
+  stat_pvalue_manual(simpson_sig_down, label = "FDR", size =1.75) +
+  scale_fill_manual(values=phenocols_sex) +
+  scale_color_manual(values=phenocols_sex_dark) + theme(legend.position = "none")
+
+
+ggsave("inv_simpson_down.pdf", height=1.7, width=1.95)
+```
+
+#### gini
+
+```{r}
+down_div_gini <- repDiversity(down_clustered_bcr_igdata$data, "gini",.col = "nt+v+j")
+
+down_div_gini_meta <- merge(down_div_gini, down_clustered_bcr_igdata$meta,  by.x ="row.names",by.y = "Sample")
+down_div_gini_meta <- merge(down_div_gini_meta,total_clones_per_downsample, by.x ="Row.names",by.y = "Sample")
+
+
+set.seed(12345)
+lm_gini_down<-lm(log10(V1) ~ phenotype*Sex + SeqBatch, data = down_div_gini_meta)
+set.seed(12345)
+emm <- emmeans(lm_gini_down, ~ phenotype | Sex)
+pairwise <- contrast(emm, method = "pairwise", adjust = "BH")
+emm_pairwise_gini_down <- as.data.frame(pairwise)
+
+
+#pval is already adjusted
+gini_sig_down <- emm_pairwise_gini_down  %>%
+  tidyr::separate_wider_delim(contrast, delim = " - ", names = c("group1", "group2"), cols_remove = FALSE) %>%
+  mutate(group1 = paste(Sex, group1, sep = "_"),
+         group2 = paste(Sex, group2, sep = "_"),
+         FDR = round(p.value,3))%>%
+filter(FDR < 0.05)%>%
+ group_by(Sex) %>%
+  mutate(
+    y.position = seq(
+      max(down_div_gini_meta$V1, na.rm = TRUE) *1.10,
+      max(down_div_gini_meta$V1, na.rm = TRUE) *1.20,
+      length.out = n()
+    )
+  ) %>%
+  ungroup()
+
+
+ggplot(down_div_gini_meta, aes(x=phenotype_sex, y = V1, fill = phenotype_sex))+ 
+  geom_boxplot(outliers=FALSE, alpha = 0.8) + 
+  geom_jitter(width =0.1, height =0, size = 0.5) +
+  scale_fill_manual(breaks = unique(down_sample_summaries$phenotype_sex),
+                     values=phenocols_sex) +
+  
+  scale_color_manual(breaks = unique(down_sample_summaries$phenotype_sex),
+                     values=phenocols_sex_dark) +
+  stat_pvalue_manual(gini_sig_down, label = "FDR", size =1.75) +
+  labs(y = "Gini",
+       title = "Downsampled",
+       x = NULL)
+
+
+ggsave("down_gini.pdf", height=1.6, width=1.88)
+```
+
+#### shannon
+
+```{r}
+down_div_shannon <- repDiversity(down_clustered_bcr_igdata$data, "hill",.min.q=1, .max.q=1,.col = "nt+v+j")
+
+down_div_shannon_meta <- merge(down_div_shannon, down_clustered_bcr_igdata$meta,  by = "Sample")
+down_div_shannon_meta <- merge(down_div_shannon_meta,total_clones_per_downsample, by = "Sample")
+
+
+
+set.seed(12345)
+# not normal residuals
+down_div_shannon_meta$t_value = log10(max(down_div_shannon_meta$Value + 1) - down_div_shannon_meta$Value) 
+
+lm_shannon_down<-lm(t_value ~ phenotype*Sex + SeqBatch, data = down_div_shannon_meta)
+set.seed(12345)
+emm <- emmeans(lm_shannon_down, ~ phenotype | Sex)
+pairwise <- contrast(emm, method = "pairwise", adjust = "BH")
+emm_pairwise_shannon_down <- as.data.frame(pairwise)
+
+
+#pval is already adjusted
+shannon_sig_down <- emm_pairwise_shannon_down  %>%
+  tidyr::separate_wider_delim(contrast, delim = " - ", names = c("group1", "group2"), cols_remove = FALSE) %>%
+  mutate(group1 = paste(Sex, group1, sep = "_"),
+         group2 = paste(Sex, group2, sep = "_"),
+         FDR = round(p.value,3))%>%
+filter(FDR <= 0.050)%>%
+ group_by(Sex) %>%
+  mutate(
+    y.position = seq(
+      max(down_div_shannon_meta$Value, na.rm = TRUE) *1.10,
+      max(down_div_shannon_meta$Value, na.rm = TRUE) *1.20,
+      length.out = n()
+    )
+  ) %>%
+  ungroup()
+
+
+ggplot(down_div_shannon_meta, aes(x=phenotype_sex, y = Value, fill = phenotype_sex))+ 
+  geom_boxplot(outliers = FALSE, alpha = 0.8) + 
+  geom_jitter(width =0.1, height =0, size = 0.5) +
+  scale_fill_manual(breaks = unique(down_sample_summaries$phenotype_sex),
+                     values=phenocols_sex) +
+  
+  scale_color_manual(breaks = unique(down_sample_summaries$phenotype_sex),
+                     values=phenocols_sex_dark) +
+  stat_pvalue_manual(shannon_sig_down, label = "FDR", size =1.75) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1)))+
+  labs(y = "exponential of Shannon entropy",
+       title = "Downsampled",
+       x = NULL) + theme(legend.position = "none", axis)
+
+
+ggsave("down_exp_shannon.pdf", height=1.7, width=1.95)
+```
+
