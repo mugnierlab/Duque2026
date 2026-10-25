@@ -1461,10 +1461,25 @@ gsea_list_Prog_A_B_F= BP_MF_GSEA(annotation = annotProg_A_B_F, comp = "ABvAA")
 simple_gsea_list_Prog_A_B_F=simplify_gsea(gsea_list_Prog_A_B_F, sim_cutoff = 0.7)
 simple_gsea_df_Prog_A_B_F = gsea_simple_df(simple_gsea_list_Prog_A_B_F)
 
+
+
+max_nes <- 3.201644+0.001#3.007278+0.001
+min_nes <- -3.201644-0.001
+max_pval <- 8.011847+0.001
+min_pval <- 2.590568-0.001
+
+ht = 2.02
+  
+wrap_width <- 50
+  
+  
+  
+  
+  
 ```
 
-```{r, fig.width=4.5, fig.height=2.8}
-for (i in seq_along(simple_gsea_df_Prog_A_B_F)) {
+```{r, fig.width=3.4928, fig.height=2}
+for (i in seq_along(simple_gsea_df_Prog_A_B_F[1])) {
   
   x <- simple_gsea_df_Prog_A_B_F[[i]]
   name <- names(simple_gsea_df_Prog_A_B_F)[[i]]
@@ -1472,26 +1487,44 @@ for (i in seq_along(simple_gsea_df_Prog_A_B_F)) {
   if (nrow(x)>10){
     x <- x[1:10,]
   }
-   
+
+  
+wrapped_labels <- strwrap(as.character(x$Description), width = wrap_width)
+  
+  # get max line length AFTER wrapping
+  max_line_length <- max(nchar(unlist(wrapped_labels)), na.rm = TRUE)
+    
+  wd <- 2.3 + 0.0284 * max_line_length  
+  print(paste0("length: ",max_line_length))
+  print(paste0("width: ",wd))
+  
+# predefine limits and breaks
+  
 p <- ggplot(x, aes(x = GeneRatio, y = Description, size = -log10(p.adjust), color = NES)) +
     geom_point(na.rm = TRUE, aes(size = -log10(p.adjust), color = NES), shape = 21, fill = NA, stroke = 0.6, alpha = 0.9) +  
     geom_point(na.rm = TRUE, aes(size = -log10(p.adjust), fill = NES), shape = 21, color = "black", stroke = 0.6)+  # Avoid plotting NA values
-    scale_size_continuous(range = c(0.25, 6)) +  # Avoid size for missing data
-    scale_color_gradient2(low = "#f5b5d6", mid = "lightgrey",high = "#e3599e",midpoint = 0) + 
-  scale_fill_gradient2(low = "#f5b5d6", mid = "lightgrey",high = "#e3599e",midpoint = 0) + 
+    scale_size_continuous(range = c(0.2, 2.2), limits = c(min_pval, max_pval)) + # Avoid size for missing data
+  scale_y_discrete(labels = label_wrap(50), limits = rev, position = "right") +
+  
+    scale_color_gradient2(low = "#f5b5d6", mid = "lightgrey",high = "#e3599e",midpoint = 0, limits = c(-max_nes, max_nes)) + 
+  scale_fill_gradient2(low = "#f5b5d6", mid = "lightgrey",high = "#e3599e",midpoint = 0, limits = c(-max_nes, max_nes)) + 
+  scale_x_continuous(expand = expansion(mult = c(0.1, 0.1)))+
     theme_minimal() +
   #scale_alpha_continuous(range = c(0.3, 1)) + 
-    theme(axis.text.x = element_text(angle = 45, hjust = 1),
-          axis.text.y = element_text(size = 9),
-          legend.key.size = unit(0.4, 'cm'), #change legend key size
-          legend.title = element_text(size=9.5), #change legend title font size
-          legend.text = element_text(size=7))+
-  scale_y_discrete(labels = label_wrap(50), limits = rev) + ggtitle(name)+
-  ylab(NULL)
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 6.5, color = "black"),
+      panel.grid = element_line(linewidth = 0.2),
+      axis.text.y = element_text(size = 6.5, color = "black",hjust = 0),
+      title = element_text(size = 7, color = "black"),
+      legend.text = element_text(size = 5),
+      legend.title = element_text(size = 5.5),
+      legend.key.size = unit(7, "pt"),
+      legend.position = "left")+
+   ggtitle(name)+
+   ylab(NULL)+ xlab(NULL)
 
 print(p)
 
-  ggsave(p,filename=paste0("~/Images/GO/top10_gsea",name,"_F.pdf"),width = 4.5, height=2.8) 
+  ggsave(p,filename=paste0("~/Images/GO/top10_gsea",name,"_F.pdf"),width = wd, height=ht) 
 }
 ```
 
@@ -1813,7 +1846,7 @@ simple_gsea_df_Prog_B_CD_F = gsea_simple_df(simple_gsea_list_Prog_B_CD_F)
 
 ```
 
-```{r, fig.width=4.6, fig.height=2.8}
+```{r, fig.width=3.5496, fig.height=2}
 for (i in seq_along(simple_gsea_df_Prog_B_CD_F)) {
   
   x <- simple_gsea_df_Prog_B_CD_F[[i]]
@@ -1822,26 +1855,41 @@ for (i in seq_along(simple_gsea_df_Prog_B_CD_F)) {
   if (nrow(x)>10){
     x <- x[1:10,]
   }
+  
+  
+wrapped_labels <- strwrap(as.character(x$Description), width = wrap_width)
+  
+  # get max line length AFTER wrapping
+  max_line_length <- max(nchar(unlist(wrapped_labels)), na.rm = TRUE)
+    
+  wd <- 2.3 + 0.0284 * max_line_length  
+  print(paste0("length: ",max_line_length))
+  print(paste0("width: ",wd))
    
 p <- ggplot(x, aes(x = GeneRatio, y = Description, size = -log10(p.adjust), color = NES)) +
     geom_point(na.rm = TRUE, aes(size = -log10(p.adjust), color = NES), shape = 21, fill = NA, stroke = 0.6, alpha = 0.9) +  
     geom_point(na.rm = TRUE, aes(size = -log10(p.adjust), fill = NES), shape = 21, color = "black", stroke = 0.6)+  # Avoid plotting NA values
-    scale_size_continuous(range = c(0.25, 6)) +  # Avoid size for missing data
-    scale_color_gradient2(low = "#e174e3", mid = "lightgrey",high = "#8b2eb3",midpoint = 0) + 
-  scale_fill_gradient2(low = "#e174e3", mid = "lightgrey",high = "#8b2eb3",midpoint = 0) + 
+    scale_size_continuous(range = c(0.2, 2.2), limits = c(min_pval, max_pval)) + # Avoid size for missing data
+  scale_y_discrete(labels = label_wrap(50), limits = rev, position = "right") +
+    scale_color_gradient2(low = "#e174e3", mid = "lightgrey",high = "#8b2eb3",midpoint = 0 ,limits = c(-max_nes, max_nes)) + 
+  scale_fill_gradient2(low = "#e174e3", mid = "lightgrey",high = "#8b2eb3",midpoint = 0 ,limits = c(-max_nes, max_nes)) + 
     theme_minimal() +
+  scale_x_continuous(expand = expansion(mult = c(0.1, 0.1)))+
   #scale_alpha_continuous(range = c(0.3, 1)) + 
-    theme(axis.text.x = element_text(angle = 45, hjust = 1),
-          axis.text.y = element_text(size = 9),
-          legend.key.size = unit(0.4, 'cm'), #change legend key size
-          legend.title = element_text(size=9.5), #change legend title font size
-          legend.text = element_text(size=7))+
-  scale_y_discrete(labels = label_wrap(50), limits = rev) + ggtitle(name)+
-  ylab(NULL)
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 6.5, color = "black"),
+      panel.grid = element_line(linewidth = 0.2),
+      axis.text.y = element_text(size = 6.5, color = "black",hjust = 0),
+      title = element_text(size = 7, color = "black"),
+      legend.text = element_text(size = 5),
+      legend.title = element_text(size = 5.5),
+      legend.key.size = unit(7, "pt"),
+      legend.position = "left")+
+   ggtitle(name)+
+   ylab(NULL)+ xlab(NULL)
 
 print(p)
 
-  ggsave(p,filename=paste0("~/Images/GO/top10_gsea",name,"_F.pdf"),width = 4.6, height=2.8) 
+  ggsave(p,filename=paste0("~/Images/GO/top10_gsea",name,"_F.pdf"),width = wd, height=ht) 
 }
 ```
 
@@ -2183,7 +2231,7 @@ simple_gsea_df_Prog_A_B_M = gsea_simple_df(simple_gsea_list_Prog_A_B_M)
 
 ```
 
-```{r, fig.width=4.5, fig.height=2.8}
+```{r, fig.width=3.5496, fig.height=2}
 for (i in seq_along(simple_gsea_df_Prog_A_B_M)) {
   
   x <- simple_gsea_df_Prog_A_B_M[[i]]
@@ -2192,26 +2240,41 @@ for (i in seq_along(simple_gsea_df_Prog_A_B_M)) {
   if (nrow(x)>10){
     x <- x[1:10,]
   }
+  
+  
+wrapped_labels <- strwrap(as.character(x$Description), width = wrap_width)
+  
+  # get max line length AFTER wrapping
+  max_line_length <- max(nchar(unlist(wrapped_labels)), na.rm = TRUE)
+    
+  wd <- 2.3 + 0.0284 * max_line_length  
+  print(paste0("length: ",max_line_length))
+  print(paste0("width: ",wd))
    
 p <- ggplot(x, aes(x = GeneRatio, y = Description, size = -log10(p.adjust), color = NES)) +
     geom_point(na.rm = TRUE, aes(size = -log10(p.adjust), color = NES), shape = 21, fill = NA, stroke = 0.6, alpha = 0.9) +  
     geom_point(na.rm = TRUE, aes(size = -log10(p.adjust), fill = NES), shape = 21, color = "black", stroke = 0.6)+  # Avoid plotting NA values
-    scale_size_continuous(range = c(0.25, 6)) +  # Avoid size for missing data
-    scale_color_gradient2(low = "#f8fa89", mid = "lightgrey",high = "#f0c405",midpoint = 0) + 
-  scale_fill_gradient2(low = "#f8fa89", mid = "lightgrey",high = "#f0c405",midpoint = 0) + 
+    scale_size_continuous(range = c(0.2, 2.2), limits = c(min_pval, max_pval)) + # Avoid size for missing data
+  scale_y_discrete(labels = label_wrap(50), limits = rev, position = "right") +
+    scale_color_gradient2(low = "#f8fa89", mid = "lightgrey",high = "#f0c405",midpoint = 0 ,limits = c(min_nes, max_nes)) + 
+  scale_fill_gradient2(low = "#f8fa89", mid = "lightgrey",high = "#f0c405",midpoint = 0 ,limits = c(min_nes, max_nes)) + 
+  scale_x_continuous(expand = expansion(mult = c(0.1, 0.1)))+
     theme_minimal() +
   #scale_alpha_continuous(range = c(0.3, 1)) + 
-    theme(axis.text.x = element_text(angle = 45, hjust = 1),
-          axis.text.y = element_text(size = 9),
-          legend.key.size = unit(0.4, 'cm'), #change legend key size
-          legend.title = element_text(size=9.5), #change legend title font size
-          legend.text = element_text(size=7))+
-  scale_y_discrete(labels = label_wrap(50), limits = rev) + ggtitle(name)+
-  ylab(NULL)
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 6.5, color = "black"),
+      panel.grid = element_line(linewidth = 0.2),
+      axis.text.y = element_text(size = 6.5, color = "black",hjust = 0),
+      title = element_text(size = 7, color = "black"),
+      legend.text = element_text(size = 5),
+      legend.title = element_text(size = 5.5),
+      legend.key.size = unit(7, "pt"),
+      legend.position = "left")+
+   ggtitle(name)+
+   ylab(NULL)+ xlab(NULL)
 
 print(p)
 
-  ggsave(p,filename=paste0("~/Images/GO/top10_gsea",name,"_M.pdf"),width = 4.5, height=2.8) 
+  ggsave(p,filename=paste0("~/Images/GO/top10_gsea",name,"_M.pdf"),width = wd, height=ht) 
 }
 ```
 
@@ -2519,6 +2582,7 @@ ggsave(filename="~/Images/BCvBB_M_Volcano_labeled.pdf",height=6.5,width=7)
 All genes can be used in GSEA; GSEA aggregates the per gene statistics across genes within a gene set, therefore making it possible to detect situations where all genes in a predefined set change in a small but coordinated way. This is important since it is likely that many relevant phenotypic differences are manifested by small but consistent changes in a set of genes. the goal of GSEA is to determine whether the members of S are randomly distributed throughout the ranked gene list (L) or primarily found at the top or bottom. When the entire gene sets are evaluated, the estimated significance level is adjusted to account for multiple hypothesis testing and also q-values are calculated for FDR control.
 
 
+
 ```{r}
 gsea_list_Prog_B_CD_M= BP_MF_GSEA(annotation = annotProg_B_CD_M,comp="BCvBB") 
 
@@ -2531,7 +2595,7 @@ simple_gsea_df_Prog_B_CD_M = gsea_simple_df(simple_gsea_list_Prog_B_CD_M)
 
 ```
 
-```{r, fig.width=5.2, fig.height=3.2}
+```{r, fig.width=3.6348, fig.height=2}
 for (i in seq_along(simple_gsea_df_Prog_B_CD_M)) {
   
   x <- simple_gsea_df_Prog_B_CD_M[[i]]
@@ -2540,26 +2604,41 @@ for (i in seq_along(simple_gsea_df_Prog_B_CD_M)) {
   if (nrow(x)>10){
     x <- x[1:10,]
   }
+  
+  
+  wrapped_labels <- strwrap(as.character(x$Description), width = wrap_width)
+  
+  # get max line length AFTER wrapping
+  max_line_length <- max(nchar(unlist(wrapped_labels)), na.rm = TRUE)
+    
+  wd <- 2.3 + 0.0284 * max_line_length  
+  print(paste0("length: ",max_line_length))
+  print(paste0("width: ",wd))
    
 p <- ggplot(x, aes(x = GeneRatio, y = Description, size = -log10(p.adjust), color = NES)) +
     geom_point(na.rm = TRUE, aes(size = -log10(p.adjust), color = NES), shape = 21, fill = NA, stroke = 0.6, alpha = 0.9) +  
     geom_point(na.rm = TRUE, aes(size = -log10(p.adjust), fill = NES), shape = 21, color = "black", stroke = 0.6)+  # Avoid plotting NA values
-    scale_size_continuous(range = c(0.25, 6)) +  # Avoid size for missing data
-    scale_color_gradient2(low = "#ffa45e", mid = "lightgrey",high = "#ed5b37",midpoint = 0) + 
-  scale_fill_gradient2(low = "#ffa45e", mid = "lightgrey",high = "#ed5b37",midpoint = 0) +
+    scale_size_continuous(range = c(0.2, 2.2), limits = c(min_pval, max_pval)) + # Avoid size for missing data
+  scale_y_discrete(labels = label_wrap(50), limits = rev, position = "right") +
+    scale_color_gradient2(low = "#ffa45e", mid = "lightgrey",high = "#ed5b37",midpoint = 0 ,limits = c(-max_nes, max_nes)) + 
+  scale_fill_gradient2(low = "#ffa45e", mid = "lightgrey",high = "#ed5b37",midpoint = 0 ,limits = c(-max_nes, max_nes)) + 
+  scale_x_continuous(expand = expansion(mult = c(0.1, 0.1)))+
     theme_minimal() +
   #scale_alpha_continuous(range = c(0.3, 1)) + 
-    theme(axis.text.x = element_text(angle = 45, hjust = 1),
-          axis.text.y = element_text(size = 9),
-          legend.key.size = unit(0.4, 'cm'), #change legend key size
-          legend.title = element_text(size=9.5), #change legend title font size
-          legend.text = element_text(size=7))+
-  scale_y_discrete(labels = label_wrap(50), limits = rev) + ggtitle(name)+
-  ylab(NULL)
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 6.5, color = "black"),
+      panel.grid = element_line(linewidth = 0.2),
+      axis.text.y = element_text(size = 6.5, color = "black",hjust = 0),
+      title = element_text(size = 7, color = "black"),
+      legend.text = element_text(size = 5),
+      legend.title = element_text(size = 5.5),
+      legend.key.size = unit(7, "pt"),
+      legend.position = "left")+
+   ggtitle(name)+
+   ylab(NULL)+ xlab(NULL)
 
 print(p)
 
-  ggsave(p,filename=paste0("~/Images/GO/top10_gsea",name,"_M.pdf"),width = 4.5, height=2.8) 
+  ggsave(p,filename=paste0("~/Images/GO/top10_gsea",name,"_M.pdf"),width = wd, height=ht) 
 }
 ```
 
