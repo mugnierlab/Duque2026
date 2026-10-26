@@ -1,0 +1,285 @@
+---
+title: "ColHearts_Bcell"
+format: html
+editor: visual
+---
+
+# set up
+```{r}
+phenocols <-  c("NCDCM" = "#0A51A0", "CCC" = "#862866")
+
+phenocols_sex = c(F_CCC= "#4e2985",
+                  M_CCC= "#bf2626",
+                  `F_NCDCM` =  "#0c2fb0" ,
+                  `M_NCDCM` ="#07736f")
+
+```
+
+
+```{r setup, include=FALSE}
+library(ggplot2)
+
+theme_set(
+  theme_classic() +
+    theme(
+      strip.text = element_text(face = "bold", size = 6.5),
+      axis.text.x = element_text(size = 5, color = "black"),
+      axis.text.y = element_text(size = 5, color = "black"),
+      axis.title.y = element_text(size = 6, color = "black"),
+      axis.title.x = element_text(size = 6, color = "black"),
+      title = element_text(size = 6.5, color = "black"),
+     legend.text = element_text(size = 5),
+    legend.title = element_text(size = 6),
+    legend.key.size = unit(9, "pt")
+    )
+)
+```
+
+set up beta regression with
+
+```{r}
+library(betareg)
+library(glmmTMB)
+library(dplyr)
+library(ggpubr)
+
+
+run_betaregression <- function(df, response, design_vars = NULL) {
+  
+  y <- df[[response]]
+  # Smithson & Verkuilen transformation to avoid 0 and 1 (not needed since is alrady bound by 0 and 1)
+  #n <- length(y)
+  #y_trans <- (y * (n - 1) + 0.5) / n
+  
+  df$y_beta <- y
+  
+  # Construct formula
+  if (is.null(design_vars) || length(design_vars) == 0) {
+    formula <- as.formula("y_beta ~ 1")
+  } else {
+    formula <- as.formula(
+      paste("y_beta ~", paste(design_vars, collapse = " + "))
+    )
+  }
+  
+  # Run beta regression
+  model <- betareg(formula, data = df)
+  
+  return(model)
+}
+
+
+
+run_betaregression_mixedeffect <- function(df, response, design_vars = NULL) {
+  
+  y <- df[[response]] 
+  
+  # Smithson & Verkuilen transformation to avoid 0 and 1
+  #n <- length(y)
+  #y_trans <- (y * (n - 1) + 0.5) / n
+  
+  df$y_beta <- y #y_trans
+  
+  # Construct formula
+  if (is.null(design_vars) || length(design_vars) == 0) {
+    formula <- as.formula("y_beta ~ 1")
+  } else {
+    formula <- as.formula(
+      paste("y_beta ~", paste(design_vars, collapse = " + "))
+    )
+  }
+  
+  # Run beta regression
+  model <- glmmTMB(formula, data = df, family = beta_family()
+)
+  
+  return(model)
+}
+
+
+
+```
+
+
+
+# Group Comparisons
+
+
+```{r}
+region_codes = data.frame(Region = c(21:27),
+                          Region_name=c("Apex","LV-ant","LV-post","RV-post","LA","RA","Septum"))
+
+database <- read.csv("~/ChagasCardiomyopathy_DATA_2026-03-07_1014.csv")
+
+database$Patient <- database$study_id
+database$Patient <- gsub("_", "", database$Patient)
+database$Patient <- sub("-test$", "", database$Patient)
+
+
+simple_database <- subset(database, redcap_event_name == "recruitment_arm_1")
+simple_database <- subset(simple_database, select = c("Patient","sex","rec_age","b_eia_res"))
+
+simple_database <- simple_database %>% 
+  rename(Serology = b_eia_res) %>% 
+  mutate( Disease = 
+            case_when(Serology == 0 ~ "NCDCM",  
+                      Serology == 1 ~ "CCC"),
+          Disease = factor(Disease, levels = c("NCDCM", "CCC")),
+          sex = case_when(
+              sex == 0 ~ "M",
+              sex == 1 ~ "F",
+              TRUE ~ NA_character_
+            ),
+          sex = factor(sex))
+```
+
+```{r}
+qupath_Bcell_counts <- read.csv("~/tissue_Bcell_summary_LVpost2.csv")
+
+qupath_Bcell_counts$Image <- sub(".*?(COL)", "\\1", qupath_Bcell_counts$Image)
+qupath_Bcell_counts$Patient <- sub("_.*", "", qupath_Bcell_counts$Image)
+
+Bcell_counts <- qupath_Bcell_counts %>% 
+  group_by(Patient) %>%
+  summarise(
+    total_area_mm2 = sum(TissueArea_um2)/1000000,
+    total_cells = sum(TotalCells),
+    CD20_only = sum(CD20_Only),
+    CD79a_only = sum(CD79a_Only),
+    CD20_CD79a = sum(CD20_CD79a_Both),
+    B_cells = (CD20_CD79a + CD79a_only),
+    CD20_per_mm2 = (CD20_only + CD20_CD79a) / total_area_mm2,
+    CD79a_per_mm2 = (CD79a_only + CD20_CD79a) / total_area_mm2,
+    Bcell_per_mm2 = (CD20_CD79a + CD20_only + CD79a_only) / total_area_mm2,
+    proportion_CD20 = (CD20_only + CD20_CD79a) / total_cells,
+    proportion_CD79a = (CD79a_only + CD20_CD79a)  / total_cells,
+    proportion_Bcell = (CD20_CD79a + CD20_only + CD79a_only) / total_cells
+  )
+
+
+Bcell_counts <- merge(Bcell_counts, simple_database, all.x = TRUE, by = "Patient")
+
+```
+
+```{r}
+##cannot do linear model. does not meet assumptions
+#test <-lm(Bcell_per_mm2 ~ Disease, data = Bcell_counts)
+#plot(test)
+
+Bcell_area_model <- wilcox.test(CD79a_per_mm2 ~ Disease, data = Bcell_counts)
+Bcell_area_stat <- data.frame(
+  pval = round(Bcell_area_model$p.value, 3),
+  sig = case_when(
+    Bcell_area_model$p.value < 0.001 ~ "***",
+    Bcell_area_model$p.value < 0.01  ~ "**",
+    Bcell_area_model$p.value < 0.05  ~ "*",
+    TRUE                             ~ "ns"
+  ),
+  group1 = "NCDCM",
+  group2 = "CCC",
+  y.position = max(Bcell_counts$Bcell_per_mm2, na.rm = TRUE) * 1.1
+)
+
+
+
+Bcell_prop_model <- run_betaregression(Bcell_counts, "proportion_CD79a", design_vars = c("Disease")) 
+
+Bcell_prop_stat<-as.data.frame(summary(Bcell_prop_model)$coefficients$mean)
+
+Bcell_prop_stat<- Bcell_prop_stat %>%
+  filter(!rownames(.) == "(Intercept)") %>%
+  rename( pval= `Pr(>|z|)`)%>%
+  mutate(
+         sig = case_when(
+           pval < 0.001 ~ "***",
+           pval < 0.01  ~ "**",
+          pval < 0.05  ~ "*",
+          TRUE         ~ "ns"),
+         pval = round(pval, 3),
+         group1 = "NCDCM",
+         group2 = "CCC",
+         y.position = max(Bcell_counts$proportion_CD79a, na.rm = TRUE)*1.1)
+```
+
+
+```{r, fig.height =1.3, fig.width=2}
+library(ggplot2)
+ggplot(Bcell_counts, aes(x = Disease, y = CD79a_per_mm2, fill = Disease)) +
+  geom_boxplot(alpha = 0.7,  outliers = FALSE) +
+  geom_jitter(aes(shape = sex, color = Disease),
+              position = position_jitter(width = 0.15, height = 0),
+              size = 1.2, alpha = 0.9) +
+  scale_fill_manual(values = phenocols)+
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1)))+
+  stat_pvalue_manual(Bcell_area_stat, label = "pval", size = 2) +
+  scale_color_manual(values = phenocols)+
+  labs(
+    x = NULL,
+    y = "B cells per mm2"
+  ) 
+ggsave("~/CD79a_per_mm2.pdf", height =1.3, width=2)
+
+
+ggplot(Bcell_counts, aes(x = Disease, y = proportion_CD79a, fill = Disease)) +
+  geom_boxplot(alpha = 0.7,  outliers = FALSE) +
+  geom_jitter(aes(shape = sex, color = Disease),
+              position = position_jitter(width = 0.15, height = 0),
+              size = 1.2, alpha = 0.9) +
+  scale_fill_manual(values = phenocols)+
+  scale_color_manual(values = phenocols)+
+  scale_y_continuous(expand = expansion(mult = c(0, 0.1)))+
+  stat_pvalue_manual(Bcell_prop_stat, label = "pval", size = 2) +
+  labs(
+    x = NULL,
+    y = "B cells / all cells"
+  ) 
+
+ggsave("~/proportion_CD79a.pdf", height =1.3, width=2)
+
+
+
+```
+
+
+```{r, fig.height=3.5, fig.width=5}
+library(tidyverse)
+Bcell_props <- Bcell_counts %>%
+  mutate(
+    proportion_CD79a_only = CD79a_only / (CD79a_only + CD20_CD79a),
+    proportion_CD20_CD79a = CD20_CD79a /(CD79a_only + CD20_CD79a)
+  )
+
+Bcell_props$proportion_Bcell<- NULL
+Bcell_props$proportion_CD20 <- NULL
+Bcell_props$proportion_CD79a <- NULL
+
+Bcell_counts_long <- Bcell_props %>%
+  pivot_longer(
+    cols = starts_with("proportion_"),
+    names_to = "cell_type",
+    values_to = "proportion"
+  )
+
+
+ggplot(Bcell_counts_long, aes(x = Patient, y = proportion, fill = cell_type)) +
+  geom_col() +
+  facet_wrap(~ sex + Disease, scales = "free_x") +
+   geom_text(data = Bcell_counts,
+    aes(x = Patient, y = 1.05, label = B_cells),  # 1.05 puts it above bar
+    inherit.aes = FALSE,
+    size = 2
+  ) +  coord_cartesian(ylim = c(0, 1.1))+
+  labs(
+    x = "Patient",
+    y = "Proportion",
+    fill = "Cell type"
+  ) +
+  scale_fill_manual(values = c("orange","#ed2b2b")) +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.text =  element_text(size = 6)
+  )
+
+ggsave("~/proportion_of_CD79a.pdf", height =3.5, width=5)
+```
+
